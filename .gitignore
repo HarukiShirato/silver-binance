@@ -1,0 +1,30 @@
+# Environment & secrets
+.env
+*.env
+!.env.example
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+*.egg-info/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local data (optional: uncomment if you don't want to track generated data)
+# data/

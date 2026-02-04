@@ -1,0 +1,11 @@
+# Core
+aiohttp>=3.9.0
+websockets>=12.0
+numpy>=1.24.0
+
+# Hyperliquid signing
+eth-account>=0.10.0
+eth-typing>=3.5.0
+
+# Utilities
+python-dotenv>=1.0.0
