@@ -7,5 +7,8 @@ numpy>=1.24.0
 eth-account>=0.10.0
 eth-typing>=3.5.0
 
+# CTP (国贸期货)
+openctp-ctp>=6.7.0
+
 # Utilities
 python-dotenv>=1.0.0

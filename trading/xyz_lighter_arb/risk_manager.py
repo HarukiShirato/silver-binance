@@ -67,6 +67,10 @@ class RiskManager:
         self._emergency_stop = False
         self._cooldown_until: float = 0
 
+        # 仓位状态 (供重启恢复)
+        self._position_state: Dict[str, dict] = {}
+        # {"SILVER": {"direction": "LONG", "lots": 3}}
+
         # 持久化路径
         self._state_file = "data/risk_state.json"
 
@@ -195,6 +199,17 @@ class RiskManager:
     def open_positions(self) -> Dict[str, TradeRecord]:
         return self._open_positions
 
+    def save_position_state(self, pair_name: str, direction: str, lots: int):
+        """保存仓位状态 (供崩溃恢复)"""
+        if direction == "NONE" or lots <= 0:
+            self._position_state.pop(pair_name, None)
+        else:
+            self._position_state[pair_name] = {"direction": direction, "lots": lots}
+
+    def get_position_state(self, pair_name: str) -> Optional[dict]:
+        """获取保存的仓位状态"""
+        return self._position_state.get(pair_name)
+
     def get_summary(self) -> str:
         """获取状态摘要"""
         stats = self.daily_stats
@@ -230,8 +245,11 @@ class RiskManager:
                     "lighter_price": v.lighter_price,
                     "spread": v.spread,
                     "zscore": v.zscore,
+                    "pnl": v.pnl,
+                    "status": v.status,
                 } for k, v in self._open_positions.items()
-            }
+            },
+            "position_state": self._position_state,
         }
 
         os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
@@ -264,100 +282,14 @@ class RiskManager:
             for k, v in state.get("open_positions", {}).items():
                 self._open_positions[k] = TradeRecord(**v)
 
+            # 恢复仓位状态
+            self._position_state = state.get("position_state", {})
+
             logger.info(f"Loaded risk state: {self.get_summary()}")
 
         except Exception as e:
             logger.error(f"Failed to load risk state: {e}")
 
 
-class PositionManager:
-    """仓位管理器"""
 
-    def __init__(
-        self,
-        capital: float,
-        leverage: int,
-        max_position_pct: float = 1.0,
-        split_orders: int = 3,
-        max_single_order: float = 20000,
-        fixed_size: float = 0,
-        max_book_pct: float = 0.2,
-        max_oi_pct: float = 0.005,
-    ):
-        self.capital = capital
-        self.leverage = leverage
-        self.max_position_pct = max_position_pct
-        self.split_orders = split_orders
-        self.max_single_order = max_single_order
-        self.fixed_size = fixed_size
-        self.max_book_pct = max_book_pct
-        self.max_oi_pct = max_oi_pct
-
-    def calculate_order_size(
-        self,
-        price: float,
-        min_size: float,
-        size_decimals: int,
-        book_depth_size: float = 0,  # 订单簿前5档总量
-        open_interest: float = 0,     # 当前OI (USDC)
-    ) -> List[float]:
-        """
-        计算订单大小，考虑多重约束：
-        1. 资金约束: 本金 × 杠杆
-        2. 流动性约束: 订单簿深度的 max_book_pct
-        3. OI约束: 总OI的 max_oi_pct
-        4. 单笔限额: max_single_order
-
-        取所有约束的最小值
-        """
-
-        # 约束1: 资金约束
-        if self.fixed_size > 0:
-            capital_size = self.fixed_size
-        else:
-            max_position_value = self.capital * self.leverage * self.max_position_pct
-            capital_size = max_position_value / price
-
-        # 约束2: 订单簿流动性约束
-        if book_depth_size > 0:
-            book_size = book_depth_size * self.max_book_pct
-        else:
-            book_size = float('inf')
-
-        # 约束3: OI约束
-        if open_interest > 0:
-            oi_size = (open_interest * self.max_oi_pct) / price
-        else:
-            oi_size = float('inf')
-
-        # 约束4: 单笔限额约束
-        single_order_size = self.max_single_order / price
-
-        # 取最小值
-        target_size = min(capital_size, book_size, oi_size, single_order_size)
-
-        logger.info(
-            f"Size constraints: capital={capital_size:.2f}, "
-            f"book={book_size:.2f}, oi={oi_size:.2f}, "
-            f"single={single_order_size:.2f} -> target={target_size:.2f}"
-        )
-
-        # 确保至少达到最小下单量
-        if target_size < min_size:
-            logger.warning(f"Target size {target_size:.4f} < min_size {min_size}, using min_size")
-            return [min_size]
-
-        # 检查是否需要拆分 (如果目标数量超过单笔限额的数量)
-        if target_size > single_order_size:
-            num_orders = min(self.split_orders, int(target_size / single_order_size) + 1)
-            size_per_order = target_size / num_orders
-
-            if size_per_order < min_size:
-                num_orders = int(target_size / min_size)
-                size_per_order = target_size / num_orders
-
-            orders = [round(size_per_order, size_decimals) for _ in range(num_orders)]
-            logger.info(f"Split order: total={target_size:.4f}, orders={orders}")
-            return orders
-
-        return [round(target_size, size_decimals)]
+# PositionManager 已拆分至 position_manager.py

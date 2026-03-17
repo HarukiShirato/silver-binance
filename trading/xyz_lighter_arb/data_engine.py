@@ -1,0 +1,195 @@
+# data_engine.py - Layer 1: 数据引擎
+#
+# 整合 CTP tick + HL WebSocket + 汇率, 输出标准化价格 (NormalizedPrice)
+# 所有价格统一转换为 RMB/kg 进行价差比较
+
+import asyncio
+import json
+import time
+from dataclasses import dataclass
+from typing import Optional, Callable, Any, List
+
+import websockets
+
+from exchanges.ctp_gateway import CTPGateway, TickData
+from exchanges.hyperliquid import HyperliquidClient
+from forex_feed import ForexFeed
+from session_manager import SessionManager
+from unit_converter import hl_usd_oz_to_cny_kg
+from config import TradingPair
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class NormalizedPrice:
+    """标准化价格 (两腿统一为 RMB/kg)"""
+    # AG 侧 (CTP)
+    ag_price: float          # 最新价 (RMB/kg)
+    ag_bid: float            # 买一价
+    ag_ask: float            # 卖一价
+    ag_bid_vol: int          # 买一量
+    ag_ask_vol: int          # 卖一量
+    # HL 侧
+    hl_price_usd: float      # 原始价格 (USD/oz)
+    hl_price_cny_kg: float   # 换算后价格 (RMB/kg)
+    # 汇率
+    usdcny: float
+    # 元信息
+    timestamp: float
+    ag_stale: bool = False   # AG tick 是否过期
+    hl_stale: bool = False   # HL 价格是否过期
+    forex_stale: bool = False  # 汇率是否过期 (>1h 未更新)
+
+
+class DataEngine:
+    """数据引擎: CTP + HL + 汇率 → NormalizedPrice"""
+
+    STALE_THRESHOLD = 5.0  # 价格超过5秒视为过期
+
+    def __init__(
+        self,
+        ctp_gateway: CTPGateway,
+        hl_client: HyperliquidClient,
+        forex_feed: ForexFeed,
+        session_manager: SessionManager,
+        pair: TradingPair,
+    ):
+        self._ctp = ctp_gateway
+        self._hl = hl_client
+        self._forex = forex_feed
+        self._session_mgr = session_manager
+        self._pair = pair
+
+        # 最新数据
+        self._ag_tick: Optional[TickData] = None
+        self._hl_mid: float = 0
+        self._hl_update_time: float = 0
+        self._latest: Optional[NormalizedPrice] = None
+
+        # 回调
+        self._callbacks: List[Callable] = []
+
+        # 状态
+        self._running = False
+
+    @property
+    def latest(self) -> Optional[NormalizedPrice]:
+        return self._latest
+
+    @property
+    def hl_last_update_age(self) -> float:
+        """HL 价格数据年龄 (秒), 未收到过数据时返回 -1"""
+        if self._hl_update_time == 0:
+            return -1
+        return time.time() - self._hl_update_time
+
+    def on_price(self, callback: Callable[[NormalizedPrice], Any]):
+        """注册价格更新回调"""
+        self._callbacks.append(callback)
+
+    async def start(self):
+        """启动数据源"""
+        self._running = True
+
+        # 1. CTP: 订阅行情, 注册 tick 回调
+        instrument = self._pair.ctp_instrument
+        self._ctp.subscribe(instrument)
+        self._ctp.on_tick(instrument, self._on_ag_tick)
+        logger.info(f"已订阅 CTP 行情: {instrument}")
+
+        # 2. HL: 启动 WebSocket 获取实时价格
+        asyncio.create_task(self._run_hl_ws())
+
+        # 3. 汇率: 启动定时获取
+        asyncio.create_task(self._forex.start())
+
+        logger.info("DataEngine 启动完成")
+
+    async def _on_ag_tick(self, tick: TickData):
+        """CTP tick 回调 (由 CTP 线程通过 call_soon_threadsafe 调度)"""
+        self._ag_tick = tick
+        await self._emit_price()
+
+    async def _run_hl_ws(self):
+        """HL WebSocket 连接和接收 (指数退避重连)"""
+        hl_symbol = f"xyz:{self._pair.hl_symbol}"
+        backoff = 2  # 初始重连间隔 (秒)
+        max_backoff = 30  # 最大重连间隔
+
+        while self._running:
+            try:
+                async with websockets.connect(self._hl.ws_url) as ws:
+                    logger.info("HL WebSocket 已连接")
+                    backoff = 2  # 连接成功, 重置退避
+
+                    # 订阅 allMids
+                    await ws.send(json.dumps({
+                        "method": "subscribe",
+                        "subscription": {"type": "allMids"}
+                    }))
+
+                    async for message in ws:
+                        if not self._running:
+                            break
+                        data = json.loads(message)
+                        if data.get("channel") == "allMids":
+                            mids = data.get("data", {}).get("mids", {})
+                            if hl_symbol in mids:
+                                self._hl_mid = float(mids[hl_symbol])
+                                self._hl_update_time = time.time()
+                                await self._emit_price()
+
+            except Exception as e:
+                if self._running:
+                    logger.error(f"HL WebSocket 错误: {e}, {backoff}s 后重连")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+
+    async def _emit_price(self):
+        """构建 NormalizedPrice 并通知回调"""
+        if not self._ag_tick or self._hl_mid <= 0:
+            return
+
+        # 汇率尚未获取过 (last_update_time==0), 等待首次获取完成
+        if self._forex.last_update_time == 0:
+            return
+
+        now = time.time()
+        forex_stale = self._forex.is_stale
+        if forex_stale:
+            logger.warning(
+                f"汇率数据过期! 上次更新: {now - self._forex.last_update_time:.0f}s 前, "
+                f"当前使用: {self._forex.usdcny:.4f}"
+            )
+
+        usdcny = self._forex.usdcny
+        hl_cny_kg = hl_usd_oz_to_cny_kg(self._hl_mid, usdcny)
+
+        self._latest = NormalizedPrice(
+            ag_price=self._ag_tick.last_price,
+            ag_bid=self._ag_tick.bid_price1,
+            ag_ask=self._ag_tick.ask_price1,
+            ag_bid_vol=self._ag_tick.bid_volume1,
+            ag_ask_vol=self._ag_tick.ask_volume1,
+            hl_price_usd=self._hl_mid,
+            hl_price_cny_kg=hl_cny_kg,
+            usdcny=usdcny,
+            timestamp=now,
+            ag_stale=(now - self._ag_tick.timestamp) > self.STALE_THRESHOLD,
+            hl_stale=(now - self._hl_update_time) > self.STALE_THRESHOLD,
+            forex_stale=forex_stale,
+        )
+
+        for cb in self._callbacks:
+            try:
+                await cb(self._latest)
+            except Exception as e:
+                logger.error(f"价格回调错误: {e}")
+
+    async def stop(self):
+        """停止"""
+        self._running = False
+        await self._forex.stop()
+        logger.info("DataEngine 已停止")

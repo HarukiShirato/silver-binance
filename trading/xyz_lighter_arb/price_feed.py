@@ -1,4 +1,5 @@
-# price_feed.py - WebSocket 实时价格推送
+# DEPRECATED: 已被 data_engine.py 替代
+# price_feed.py - 旧版 WebSocket 价格推送 (仅保留作参考)
 
 import asyncio
 import json

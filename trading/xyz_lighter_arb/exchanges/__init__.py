@@ -1,4 +1,4 @@
 from .hyperliquid import HyperliquidClient
-from .lighter import LighterClient
+from .ctp_gateway import CTPGateway
 
-__all__ = ['HyperliquidClient', 'LighterClient']
+__all__ = ['HyperliquidClient', 'CTPGateway']

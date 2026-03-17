@@ -136,9 +136,9 @@ class FeishuNotifier:
         fields = {
             "信号": signal,
             "交易对": pair_name,
-            "XYZ价格": f"${xyz_price:.4f}",
-            "Lighter价格": f"${lighter_price:.4f}",
-            "价差": f"${spread:.4f}",
+            "AG价格": f"¥{xyz_price:.1f}/kg",
+            "HL价格": f"${lighter_price:.4f}/oz",
+            "价差": f"{spread:.3f}%",
             "Z-score": f"{zscore:.2f}",
             "数量": f"{size:.4f}",
         }
@@ -162,10 +162,10 @@ class FeishuNotifier:
         fields = {
             "状态": status,
             "信号": signal,
-            "XYZ成交价": f"${xyz_fill_price:.4f}",
-            "Lighter成交价": f"${lighter_fill_price:.4f}",
+            "AG成交价": f"¥{xyz_fill_price:.1f}/kg",
+            "HL成交价": f"${lighter_fill_price:.4f}/oz",
             "成交数量": f"{size:.4f}",
-            "手续费": f"${fees:.4f}",
+            "手续费": f"¥{fees:.2f}",
         }
 
         await self.send_card(title, fields, color)
@@ -214,6 +214,53 @@ class FeishuNotifier:
 
         await self.send_card(title, fields, color)
 
+    async def notify_margin_warning(
+        self,
+        account_name: str,
+        level: str,
+        margin_ratio: float,
+        used_margin: float,
+        balance: float,
+        available: float,
+    ):
+        """保证金预警通知"""
+        color_map = {
+            "warning": "orange",
+            "danger": "red",
+            "critical": "red",
+        }
+        emoji_map = {
+            "warning": "⚠️",
+            "danger": "🔴",
+            "critical": "🚨",
+        }
+        color = color_map.get(level, "orange")
+        emoji = emoji_map.get(level, "⚠️")
+
+        title = f"{emoji} {account_name} 保证金{level}"
+
+        # 格式化: CTP 用人民币, HL 用美元
+        if account_name == "CTP":
+            fields = {
+                "账户": account_name,
+                "等级": level.upper(),
+                "使用率": f"{margin_ratio:.1%}",
+                "已用保证金": f"¥{used_margin:,.0f}",
+                "总资金": f"¥{balance:,.0f}",
+                "可用资金": f"¥{available:,.0f}",
+            }
+        else:
+            fields = {
+                "账户": account_name,
+                "等级": level.upper(),
+                "使用率": f"{margin_ratio:.1%}",
+                "已用保证金": f"${used_margin:,.2f}",
+                "总资金": f"${balance:,.2f}",
+                "可用资金": f"${available:,.2f}",
+            }
+
+        await self.send_card(title, fields, color)
+
     async def notify_emergency(self, reason: str):
         """紧急停止通知"""
         title = "🚨 紧急停止"
@@ -230,7 +277,7 @@ class FeishuNotifier:
         fields = {
             "交易对": ", ".join(pairs),
             "总资金": f"${capital:,.0f}",
-            "策略": "XYZ-Lighter 价差套利",
+            "策略": "SHFE AG - HL SILVER 对冲",
             "状态": "运行中",
         }
         await self.send_card(title, fields, "blue")

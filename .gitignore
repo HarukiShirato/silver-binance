@@ -26,5 +26,17 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 
+# CTP runtime files
+*.con
+
+# CTP SDK packages
+20240117133025_9043/
+
+# CTP native .so libraries (too large, download separately)
+trading/xyz_lighter_arb/ctp_libs/
+
+# Logs
+logs/
+
 # Local data (optional: uncomment if you don't want to track generated data)
 # data/

@@ -1,4 +1,5 @@
-# strategy/spread_calculator.py - 价差计算和信号生成
+# DEPRECATED: 已被 signal_engine.py 替代 (百分比价差 + SHFE时段管理)
+# strategy/spread_calculator.py - 旧版价差计算 (仅保留作参考)
 
 import asyncio
 from collections import deque

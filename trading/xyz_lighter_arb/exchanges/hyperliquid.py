@@ -31,6 +31,9 @@ class HyperliquidClient:
         self._ws_callbacks: Dict[str, Callable] = {}
         self._running = False
 
+        # asset_id 缓存
+        self._asset_id_cache: Dict[str, int] = {}
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
@@ -160,6 +163,7 @@ class HyperliquidClient:
         client_oid: Optional[str] = None,
     ) -> Dict:
         """下单"""
+        await self._ensure_asset_ids()
         nonce = int(time.time() * 1000)
 
         # 构建订单
@@ -210,6 +214,22 @@ class HyperliquidClient:
         ) as resp:
             return await resp.json()
 
+    async def cancel_all_orders(self, coin: str) -> list:
+        """取消指定合约的所有挂单"""
+        orders = await self.get_open_orders()
+        name = coin.replace("xyz:", "")
+        to_cancel = [o for o in orders if o.get("coin") == name]
+        results = []
+        for o in to_cancel:
+            oid = o.get("oid")
+            if oid is not None:
+                r = await self.cancel_order(coin, oid)
+                results.append(r)
+                logger.info(f"已取消 HL 挂单: oid={oid}, coin={name}")
+        if not to_cancel:
+            logger.info(f"HL 无 {name} 挂单需要取消")
+        return results
+
     async def market_order(self, coin: str, is_buy: bool, size: float) -> Dict:
         """市价单 (使用滑点保护价格)"""
         # 获取当前价格
@@ -234,11 +254,61 @@ class HyperliquidClient:
             order_type="Limit",  # 用限价单模拟市价单
         )
 
+    async def _ensure_asset_ids(self):
+        """从 meta API 预缓存 asset_id 映射"""
+        if self._asset_id_cache:
+            return
+
+        session = await self._get_session()
+
+        # 查询永续合约 meta
+        async with session.post(
+            f"{self.api_url}/info",
+            json={"type": "metaAndAssetCtxs"}
+        ) as resp:
+            data = await resp.json()
+
+        universe = data[0].get("universe", []) if isinstance(data, list) else []
+        for i, asset in enumerate(universe):
+            name = asset.get("name", "")
+            self._asset_id_cache[name] = i
+
+        logger.info(f"Cached {len(self._asset_id_cache)} asset IDs")
+
     def _coin_to_asset_id(self, coin: str) -> int:
-        """将coin名称转换为asset_id (简化版本，实际需要从meta获取)"""
-        # HIP-3资产使用特殊格式，需要查询
-        # 这里返回0表示需要动态查询
-        return 0
+        """查找 coin → asset_id"""
+        # 处理 "xyz:SILVER" → "SILVER" 格式
+        name = coin.replace("xyz:", "")
+        if name in self._asset_id_cache:
+            return self._asset_id_cache[name]
+        # 尝试原名
+        if coin in self._asset_id_cache:
+            return self._asset_id_cache[coin]
+        raise ValueError(
+            f"Unknown coin: {coin}, available: {list(self._asset_id_cache.keys())[:20]}"
+        )
+
+    async def get_funding_rate(self, coin: str) -> float:
+        """获取指定合约的当前 funding rate"""
+        session = await self._get_session()
+        async with session.post(
+            f"{self.api_url}/info",
+            json={"type": "metaAndAssetCtxs"}
+        ) as resp:
+            data = await resp.json()
+
+        if not isinstance(data, list) or len(data) < 2:
+            return 0.0
+
+        universe = data[0].get("universe", [])
+        ctxs = data[1]
+
+        name = coin.replace("xyz:", "")
+        for i, asset in enumerate(universe):
+            if asset.get("name") == name and i < len(ctxs):
+                return float(ctxs[i].get("funding", 0))
+
+        return 0.0
 
     # ==================== WebSocket ====================
 

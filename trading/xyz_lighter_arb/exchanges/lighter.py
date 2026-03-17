@@ -1,4 +1,5 @@
-# exchanges/lighter.py - Lighter 交易接口
+# DEPRECATED: 已不再使用。系统已改为 CTP AG + HL SILVER 两腿对冲。
+# exchanges/lighter.py - Lighter 交易接口 (仅保留作参考)
 
 import asyncio
 import json
