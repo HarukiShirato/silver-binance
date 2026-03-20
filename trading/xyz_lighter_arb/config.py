@@ -39,13 +39,14 @@ TRADING_PAIRS: Dict[str, TradingPair] = {
 # ==================== 策略参数 ====================
 @dataclass
 class StrategyConfig:
-    # 入场/出场阈值
-    entry_zscore: float = 2.5       # Z-score入场阈值
+    # 入场/出场阈值 (来自 spread_backtest_1m.py 最优参数扫描)
+    entry_zscore: float = 1.5       # Z-score入场阈值 (原2.5, 回测最优1.5)
     exit_zscore: float = 0.5        # Z-score出场阈值
     stop_loss_zscore: float = 4.0   # 止损阈值
 
     # 价差计算窗口
-    spread_window: int = 240        # 滚动窗口大小 (tick数)
+    spread_window: int = 60         # 滚动窗口大小 (分钟, 原240 tick)
+    sample_interval: int = 60       # 采样间隔 (秒), 每60秒取一个数据点
 
     # 仓位管理
     max_position_lots: int = 10     # 最大持仓手数 (逐手加仓, 每次+1手)

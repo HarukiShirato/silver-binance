@@ -4,10 +4,15 @@
 # 公式来自 backtest/silver/spread_backtest_1m.py:
 #   spread_pct = (ag_price - hl_cny_price) / hl_cny_price * 100
 #
+# 采样方式: 每 sample_interval 秒取一个数据点加入滚动窗口,
+#   与回测中1分钟K线的统计特性保持一致.
+#   中间的 tick 仍然实时计算 z-score 用于信号判断, 但不写入窗口.
+#
 # 信号方向:
 #   LONG  = 做多价差 = 买AG + 卖HL (AG 便宜时)
 #   SHORT = 做空价差 = 卖AG + 买HL (AG 贵时)
 
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -50,17 +55,18 @@ class SignalResult:
 
 
 class SignalEngine:
-    """价差信号引擎"""
+    """价差信号引擎 (按时间采样, 与回测1分钟K线对齐)"""
 
     MIN_DATA_POINTS = 30  # 最少需要的数据点才开始出信号
 
     def __init__(
         self,
         pair_name: str,
-        window_size: int = 240,
-        entry_zscore: float = 2.5,
+        window_size: int = 60,
+        entry_zscore: float = 1.5,
         exit_zscore: float = 0.5,
         stop_loss_zscore: float = 4.0,
+        sample_interval: int = 60,
         session_manager: Optional[SessionManager] = None,
     ):
         self._pair_name = pair_name
@@ -68,10 +74,19 @@ class SignalEngine:
         self._entry_z = entry_zscore
         self._exit_z = exit_zscore
         self._stop_z = stop_loss_zscore
+        self._sample_interval = sample_interval  # 采样间隔 (秒)
         self._session_mgr = session_manager
 
-        # 滚动窗口
+        # 滚动窗口 (按时间采样的数据点)
         self._spread_pcts: deque = deque(maxlen=window_size)
+
+        # 采样控制
+        self._last_sample_time: float = 0  # 上次采样时间戳
+        self._latest_spread_pct: float = 0  # 当前最新价差 (用于采样时写入窗口)
+
+        # 缓存的统计量 (避免每个 tick 都重新计算)
+        self._cached_mean: float = 0
+        self._cached_std: float = 0
 
         # 当前持仓方向
         self._position: str = "NONE"  # NONE, LONG, SHORT
@@ -91,6 +106,11 @@ class SignalEngine:
     def update(self, price: NormalizedPrice) -> Optional[SignalResult]:
         """
         接收 NormalizedPrice, 计算价差和信号
+
+        采样逻辑:
+        - 每个 tick 都实时计算 spread_pct 和 zscore (用于信号判断)
+        - 但只有每隔 sample_interval 秒才将一个数据点写入滚动窗口
+        - 这样 window=60 + interval=60s = 60分钟窗口, 与回测一致
 
         Returns:
             SignalResult 或 None (数据不足或非交易时段)
@@ -115,8 +135,26 @@ class SignalEngine:
 
         # 百分比价差: (AG - HL_CNY) / HL_CNY * 100
         spread_pct = (price.ag_price - price.hl_price_cny_kg) / price.hl_price_cny_kg * 100
+        self._latest_spread_pct = spread_pct
 
-        self._spread_pcts.append(spread_pct)
+        # === 按时间采样: 每 sample_interval 秒写入一个数据点 ===
+        now = price.timestamp
+        if self._last_sample_time == 0:
+            # 首次: 直接采样
+            self._spread_pcts.append(spread_pct)
+            self._last_sample_time = now
+            self._update_stats()
+            logger.info(f"首次采样, spread_pct={spread_pct:.4f}%, 窗口大小={len(self._spread_pcts)}")
+        elif (now - self._last_sample_time) >= self._sample_interval:
+            # 到达采样间隔: 将最新价差写入窗口
+            self._spread_pcts.append(spread_pct)
+            self._last_sample_time = now
+            self._update_stats()
+            logger.debug(
+                f"采样: spread_pct={spread_pct:.4f}%, "
+                f"窗口={len(self._spread_pcts)}/{self._window_size}, "
+                f"mean={self._cached_mean:.4f}%, std={self._cached_std:.4f}%"
+            )
 
         # 数据不足
         if not self.data_ready:
@@ -127,18 +165,15 @@ class SignalEngine:
                 hl_price_usd_oz=price.hl_price_usd,
                 usdcny=price.usdcny,
                 spread_pct=spread_pct,
-                spread_mean=0,
-                spread_std=0,
+                spread_mean=self._cached_mean,
+                spread_std=self._cached_std,
                 zscore=0,
                 funding_rate=self._last_funding_rate,
                 timestamp=price.timestamp,
             )
 
-        # 计算 Z-score
-        arr = np.array(self._spread_pcts)
-        mean = float(np.mean(arr))
-        std = float(np.std(arr))
-        zscore = (spread_pct - mean) / std if std > 1e-8 else 0
+        # 实时计算 Z-score (用窗口的 mean/std, 但用当前最新 spread_pct)
+        zscore = (spread_pct - self._cached_mean) / self._cached_std if self._cached_std > 1e-8 else 0
 
         # 生成信号
         signal = self._generate_signal(zscore)
@@ -150,12 +185,22 @@ class SignalEngine:
             hl_price_usd_oz=price.hl_price_usd,
             usdcny=price.usdcny,
             spread_pct=spread_pct,
-            spread_mean=mean,
-            spread_std=std,
+            spread_mean=self._cached_mean,
+            spread_std=self._cached_std,
             zscore=zscore,
             funding_rate=self._last_funding_rate,
             timestamp=price.timestamp,
         )
+
+    def _update_stats(self):
+        """更新缓存的统计量 (仅在新数据点采样时调用)"""
+        if len(self._spread_pcts) < 2:
+            self._cached_mean = self._spread_pcts[0] if self._spread_pcts else 0
+            self._cached_std = 0
+            return
+        arr = np.array(self._spread_pcts)
+        self._cached_mean = float(np.mean(arr))
+        self._cached_std = float(np.std(arr))
 
     def _generate_signal(self, zscore: float) -> Signal:
         """
@@ -226,9 +271,6 @@ class SignalEngine:
         """获取最新 Z-score"""
         if not self.data_ready:
             return 0
-        arr = np.array(self._spread_pcts)
-        mean = float(np.mean(arr))
-        std = float(np.std(arr))
-        if std < 1e-8:
+        if self._cached_std < 1e-8:
             return 0
-        return (self._spread_pcts[-1] - mean) / std
+        return (self._latest_spread_pct - self._cached_mean) / self._cached_std

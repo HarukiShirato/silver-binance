@@ -84,6 +84,7 @@ class SilverHedgeBot:
             entry_zscore=STRATEGY.entry_zscore,
             exit_zscore=STRATEGY.exit_zscore,
             stop_loss_zscore=STRATEGY.stop_loss_zscore,
+            sample_interval=STRATEGY.sample_interval,
             session_manager=self.session_mgr,
         )
 
