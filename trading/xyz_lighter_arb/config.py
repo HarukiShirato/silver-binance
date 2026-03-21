@@ -5,6 +5,13 @@ from dataclasses import dataclass
 from typing import Dict
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on", "y")
+
+
 @dataclass
 class TradingPair:
     """交易对配置"""
@@ -75,8 +82,8 @@ class APIConfig:
     ctp_broker_id: str = "0187"
     ctp_user_id: str = ""
     ctp_password: str = ""
-    ctp_md_front: str = "tcp://220.160.125.12:61219"   # 行情前置
-    ctp_td_front: str = "tcp://220.160.125.12:61209"   # 交易前置
+    ctp_md_front: str = "tcp://140.206.244.75:41213"   # 行情前置
+    ctp_td_front: str = "tcp://140.206.244.75:41205"   # 交易前置
     ctp_app_id: str = "client_Lavas_1.0.0"
     ctp_auth_code: str = ""
 
@@ -85,6 +92,18 @@ class APIConfig:
     ws_ping_interval: int = 20      # WebSocket心跳间隔 (秒)
 
 API = APIConfig()
+
+
+@dataclass
+class RuntimeConfig:
+    dry_run: bool = True
+
+
+RUNTIME = RuntimeConfig()
+
+
+def load_runtime_config():
+    RUNTIME.dry_run = _env_bool("DRY_RUN", True)
 
 
 def load_api_keys():
@@ -98,19 +117,20 @@ def load_api_keys():
     API.ctp_auth_code = os.environ.get('CTP_AUTH_CODE', '')
 
 
-def validate_api_keys():
+def validate_api_keys(dry_run: bool = False):
     """校验 API 密钥是否已配置, 缺失则抛出异常"""
     missing = []
-    if not API.hl_private_key:
-        missing.append('HL_PRIVATE_KEY')
-    if not API.hl_wallet_address:
-        missing.append('HL_WALLET_ADDRESS')
     if not API.ctp_user_id:
         missing.append('CTP_USER_ID')
     if not API.ctp_password:
         missing.append('CTP_PASSWORD')
     if not API.ctp_auth_code:
         missing.append('CTP_AUTH_CODE')
+    if not dry_run:
+        if not API.hl_private_key:
+            missing.append('HL_PRIVATE_KEY')
+        if not API.hl_wallet_address:
+            missing.append('HL_WALLET_ADDRESS')
     if missing:
         raise EnvironmentError(
             f"缺少必要的 API 密钥环境变量: {', '.join(missing)}. "

@@ -4,8 +4,8 @@ CTP 仿真环境连接测试脚本
 
 国贸期货仿真环境:
   BrokerID: 0187
-  行情前置: tcp://220.160.125.12:61219
-  交易前置: tcp://220.160.125.12:61209
+  行情前置: tcp://140.206.244.75:41213
+  交易前置: tcp://140.206.244.75:41205
 
 使用方法:
   # 设置环境变量
@@ -63,8 +63,8 @@ async def main():
         broker_id="0187",
         user_id=user_id,
         password=password,
-        md_front="tcp://220.160.125.12:61219",
-        td_front="tcp://220.160.125.12:61209",
+        md_front="tcp://140.206.244.75:41213",
+        td_front="tcp://140.206.244.75:41205",
         app_id="client_Lavas_1.0.0",
         auth_code=auth_code,
     )
@@ -135,7 +135,7 @@ async def main():
     except ConnectionError as e:
         logger.error(f"连接失败: {e}")
         logger.info("请检查:")
-        logger.info("  1. 网络是否可达 220.160.125.12")
+        logger.info("  1. 网络是否可达 140.206.244.75")
         logger.info("  2. 账号密码是否正确")
         logger.info("  3. 是否在交易时段 (仿真可能有时间限制)")
     except Exception as e:
