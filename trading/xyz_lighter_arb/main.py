@@ -152,8 +152,8 @@ class SilverHedgeBot:
                 self.signal_engine.set_position(direction)
                 self.position_manager.current_lots = lots
                 logger.warning(
-                    f"鎭㈠涓婃浠撲綅: {direction} {lots}鎵?"
-                    f"(璇风‘璁や笌瀹為檯鎸佷粨涓€鑷?)"
+                    f"恢复上次持仓: {direction} {lots} 手"
+                    f"(请确认与实际持仓一致)"
                 )
 
         # 娉ㄥ唽浠锋牸鍥炶皟
@@ -181,8 +181,8 @@ class SilverHedgeBot:
     async def _process_signal(self, signal: SignalResult):
         """Handle a trading signal."""
         logger.info(
-            f"淇″彿: {signal.signal.value} | "
-            f"AG=楼{signal.ag_price:.1f} HL=${signal.hl_price_usd_oz:.4f} | "
+            f"信号: {signal.signal.value} | "
+            f"AG={signal.ag_price:.1f} CNY/kg HL=${signal.hl_price_usd_oz:.4f} | "
             f"spread={signal.spread_pct:.3f}% zscore={signal.zscore:.2f}"
         )
 
@@ -469,33 +469,33 @@ class SilverHedgeBot:
         while self._running:
             issues = []
 
-            # CTP 杩炴帴
+            # CTP 连接
             if not self.ctp_gateway.is_connected:
-                issues.append("CTP 缃戝叧鏂紑")
+                issues.append("CTP 网关断开")
 
-            # HL/AG 鏁版嵁鏂伴矞搴?
+            # HL/AG 数据新鲜度
             latest = self.data_engine.latest
             if latest:
                 if latest.hl_stale:
                     hl_age = self.data_engine.hl_last_update_age
-                    issues.append(f"HL 浠锋牸杩囨湡 ({hl_age:.0f}s)")
+                    issues.append(f"HL 价格过期 ({hl_age:.0f}s)")
                 if latest.ag_stale:
-                    issues.append("AG 琛屾儏杩囨湡")
+                    issues.append("AG 行情过期")
 
-            # 姹囩巼
+            # 汇率
             if self.forex_feed.is_stale:
-                issues.append(f"姹囩巼杩囨湡 (褰撳墠 {self.forex_feed.usdcny:.4f})")
+                issues.append(f"汇率过期 (当前 {self.forex_feed.usdcny:.4f})")
 
-            # 淇″彿寮曟搸鏁版嵁灏辩华
+            # 信号引擎数据就绪
             if not self.signal_engine.data_ready:
-                issues.append("淇″彿寮曟搸鏁版嵁涓嶈冻, 绛夊緟鏇村 tick")
+                issues.append("信号引擎数据不足，等待更多 tick")
 
-            # 绱ф€ュ仠姝?
+            # 紧急停止
             if self.risk_manager.is_emergency:
-                issues.append("绱ф€ュ仠姝㈠凡婵€娲?")
+                issues.append("紧急停止已触发")
 
             if issues:
-                msg = "鍋ュ悍妫€鏌ュ紓甯?\n" + "\n".join(f"- {i}" for i in issues)
+                msg = "健康检查异常:\n" + "\n".join(f"- {i}" for i in issues)
                 logger.warning(msg)
                 if any(kw in msg for kw in ("disconnect", "emergency")):
                     await self.notifier.notify_emergency(msg)
