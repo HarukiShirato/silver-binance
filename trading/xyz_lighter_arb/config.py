@@ -34,7 +34,7 @@ TRADING_PAIRS: Dict[str, TradingPair] = {
         name='SILVER',
         hl_symbol='SILVER',
         hl_leverage=5,
-        ctp_instrument='ag2506',      # 白银主力合约 (需要根据实际主力切换)
+        ctp_instrument='ag2606',      # 白银主力合约 (需要根据实际主力切换)
         ctp_exchange='SHFE',
         ctp_multiplier=15,            # 白银 15kg/手
         ctp_margin_rate=0.09,         # ~9% 保证金率
@@ -75,6 +75,7 @@ class APIConfig:
     # Hyperliquid
     hl_api_url: str = "https://api.hyperliquid.xyz"
     hl_ws_url: str = "wss://api.hyperliquid.xyz/ws"
+    hl_dex: str = "xyz"
     hl_private_key: str = ""
     hl_wallet_address: str = ""
 
@@ -119,6 +120,7 @@ def load_runtime_config():
 def load_api_keys():
     """从环境变量加载敏感信息"""
     # Hyperliquid
+    API.hl_dex = os.environ.get('HL_DEX', API.hl_dex)
     API.hl_private_key = os.environ.get('HL_PRIVATE_KEY', '')
     API.hl_wallet_address = os.environ.get('HL_WALLET_ADDRESS', '')
     # CTP

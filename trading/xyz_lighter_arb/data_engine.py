@@ -95,6 +95,7 @@ class DataEngine:
 
         # 1. CTP: 订阅行情, 注册 tick 回调
         instrument = self._pair.ctp_instrument
+        logger.info(f"DataEngine CTP instrument={instrument!r} type={type(instrument).__name__}")
         self._ctp.subscribe(instrument)
         self._ctp.on_tick(instrument, self._on_ag_tick)
         logger.info(f"已订阅 CTP 行情: {instrument}")
@@ -114,7 +115,9 @@ class DataEngine:
 
     async def _run_hl_ws(self):
         """HL WebSocket 连接和接收 (指数退避重连)"""
-        hl_symbol = f"xyz:{self._pair.hl_symbol}"
+        hl_symbol = self._pair.hl_symbol
+        if self._hl.dex and ":" not in hl_symbol:
+            hl_symbol = f"{self._hl.dex}:{hl_symbol}"
         backoff = 2  # 初始重连间隔 (秒)
         max_backoff = 30  # 最大重连间隔
 
@@ -125,9 +128,12 @@ class DataEngine:
                     backoff = 2  # 连接成功, 重置退避
 
                     # 订阅 allMids
+                    sub = {"type": "allMids"}
+                    if self._hl.dex:
+                        sub["dex"] = self._hl.dex
                     await ws.send(json.dumps({
                         "method": "subscribe",
-                        "subscription": {"type": "allMids"}
+                        "subscription": sub
                     }))
 
                     async for message in ws:

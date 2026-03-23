@@ -62,6 +62,7 @@ class SilverHedgeBot:
         self.hl_client = HyperliquidClient(
             api_url=API.hl_api_url,
             ws_url=API.hl_ws_url,
+            dex=API.hl_dex,
             private_key=API.hl_private_key,
             wallet_address=API.hl_wallet_address,
         )
@@ -463,7 +464,7 @@ class SilverHedgeBot:
         """Fetch funding rate periodically."""
         while self._running:
             try:
-                rate = await self.hl_client.get_funding_rate("SILVER")
+                rate = await self.hl_client.get_funding_rate(TRADING_PAIRS['SILVER'].hl_symbol)
                 self.signal_engine.update_funding_rate(rate)
                 logger.info(f"HL SILVER funding rate: {rate:.6f}")
             except Exception as e:
