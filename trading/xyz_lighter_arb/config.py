@@ -1,8 +1,8 @@
 # config.py - SHFE AG vs HL SILVER 对冲系统配置
 
 import os
-from dataclasses import dataclass
-from typing import Dict
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -53,7 +53,7 @@ class StrategyConfig:
 
     # 价差计算窗口
     spread_window: int = 60         # 滚动窗口大小 (分钟, 原240 tick)
-    sample_interval: int = 60       # 采样间隔 (秒), 每60秒取一个数据点
+    sample_interval: int = 30       # 采样间隔 (秒), 每30秒取一个数据点
 
     # 仓位管理
     max_position_lots: int = 10     # 最大持仓手数 (逐手加仓, 每次+1手)
@@ -82,8 +82,18 @@ class APIConfig:
     ctp_broker_id: str = "0187"
     ctp_user_id: str = ""
     ctp_password: str = ""
-    ctp_md_front: str = "tcp://140.206.244.75:41213"   # 行情前置
-    ctp_td_front: str = "tcp://140.206.244.75:41205"   # 交易前置
+    ctp_md_front: str = "tcp://114.80.225.10:41213"   # 行情前置(主)
+    ctp_td_front: str = "tcp://114.80.225.10:41205"   # 交易前置(主)
+    ctp_md_front_backups: List[str] = field(default_factory=lambda: [
+        "tcp://140.206.244.75:41213",
+        "tcp://140.206.244.67:41213",
+        "tcp://114.80.225.2:41213",
+    ])
+    ctp_td_front_backups: List[str] = field(default_factory=lambda: [
+        "tcp://140.206.244.75:41205",
+        "tcp://140.206.244.67:41205",
+        "tcp://114.80.225.2:41205",
+    ])
     ctp_app_id: str = "client_Lavas_1.0.0"
     ctp_auth_code: str = ""
 
@@ -115,6 +125,35 @@ def load_api_keys():
     API.ctp_user_id = os.environ.get('CTP_USER_ID', '')
     API.ctp_password = os.environ.get('CTP_PASSWORD', '')
     API.ctp_auth_code = os.environ.get('CTP_AUTH_CODE', '')
+    API.ctp_md_front = os.environ.get('CTP_MD_FRONT', API.ctp_md_front)
+    API.ctp_td_front = os.environ.get('CTP_TD_FRONT', API.ctp_td_front)
+
+    md_backups = os.environ.get('CTP_MD_FRONT_BACKUPS', '')
+    if md_backups.strip():
+        API.ctp_md_front_backups = [x.strip() for x in md_backups.split(',') if x.strip()]
+    td_backups = os.environ.get('CTP_TD_FRONT_BACKUPS', '')
+    if td_backups.strip():
+        API.ctp_td_front_backups = [x.strip() for x in td_backups.split(',') if x.strip()]
+
+
+def get_ctp_front_candidates() -> List[Tuple[str, str]]:
+    """Return [(md_front, td_front), ...] with primary first then backups."""
+    candidates: List[Tuple[str, str]] = []
+    seen = set()
+
+    primary = (API.ctp_md_front, API.ctp_td_front)
+    if all(primary):
+        candidates.append(primary)
+        seen.add(primary)
+
+    n = min(len(API.ctp_md_front_backups), len(API.ctp_td_front_backups))
+    for i in range(n):
+        pair = (API.ctp_md_front_backups[i], API.ctp_td_front_backups[i])
+        if all(pair) and pair not in seen:
+            candidates.append(pair)
+            seen.add(pair)
+
+    return candidates
 
 
 def validate_api_keys(dry_run: bool = False):

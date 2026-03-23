@@ -58,23 +58,44 @@ async def main():
         logger.info("  export CTP_AUTH_CODE='your_auth_code'")
         return
 
-    # 创建网关
-    gateway = CTPGateway(
-        broker_id="0187",
-        user_id=user_id,
-        password=password,
-        md_front="tcp://140.206.244.75:41213",
-        td_front="tcp://140.206.244.75:41205",
-        app_id="client_Lavas_1.0.0",
-        auth_code=auth_code,
-    )
+    front_candidates = [
+        ("tcp://114.80.225.10:41213", "tcp://114.80.225.10:41205"),
+        ("tcp://140.206.244.75:41213", "tcp://140.206.244.75:41205"),
+        ("tcp://140.206.244.67:41213", "tcp://140.206.244.67:41205"),
+        ("tcp://114.80.225.2:41213", "tcp://114.80.225.2:41205"),
+    ]
+    gateway = None
 
     try:
-        # 1. 连接
+        # 1. 连接(自动轮询前置)
         logger.info("=" * 60)
         logger.info("步骤 1: 连接国贸期货仿真环境...")
         logger.info("=" * 60)
-        await gateway.connect(timeout=30)
+        connected = False
+        for idx, (md_front, td_front) in enumerate(front_candidates, start=1):
+            logger.info(f"尝试前置 [{idx}/{len(front_candidates)}] MD={md_front}, TD={td_front}")
+            gateway = CTPGateway(
+                broker_id="0187",
+                user_id=user_id,
+                password=password,
+                md_front=md_front,
+                td_front=td_front,
+                app_id="client_Lavas_1.0.0",
+                auth_code=auth_code,
+            )
+            try:
+                await gateway.connect(timeout=30)
+                connected = True
+                logger.info(f"前置连接成功: MD={md_front}, TD={td_front}")
+                break
+            except Exception as e:
+                logger.warning(f"前置连接失败: {e}")
+                await gateway.close()
+                gateway = None
+
+        if not connected or gateway is None:
+            raise ConnectionError("所有 CTP 前置均连接失败")
+
         logger.info(f"交易日: {gateway.trading_day}")
 
         # 2. 订阅行情 (白银主力 + 黄金主力)
@@ -141,7 +162,8 @@ async def main():
     except Exception as e:
         logger.error(f"测试出错: {e}", exc_info=True)
     finally:
-        await gateway.close()
+        if gateway:
+            await gateway.close()
 
 
 if __name__ == "__main__":
