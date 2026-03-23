@@ -47,7 +47,7 @@ class RiskManager:
         max_daily_loss: float = 2000,
         leg_timeout_ms: int = 2000,
         leg_retry_times: int = 2,
-        emergency_spread_pct: float = 5.0,
+        emergency_spread_pct: float = 15.0,
     ):
         self.max_daily_trades = max_daily_trades
         self.max_daily_loss = max_daily_loss

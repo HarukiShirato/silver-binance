@@ -196,7 +196,7 @@ class RiskConfig:
     max_daily_loss: float = 5000    # 每日最大亏损 (RMB)
     leg_timeout_sec: float = 2.0    # 第二腿超时时间 (秒)
     leg_retry_times: int = 2        # 第二腿重试次数
-    emergency_spread_pct: float = 5.0  # 价差超过5%紧急停止
+    emergency_spread_pct: float = 15.0  # 价差超过15%紧急停止
     # 保证金预警阈值 (CTP 和 HL 共用)
     margin_warning_pct: float = 0.70   # 70% 预警
     margin_danger_pct: float = 0.85    # 85% 危险 (禁止加仓)
