@@ -451,6 +451,7 @@ class SilverHedgeBot:
             asyncio.create_task(self._health_monitor_loop()),
             asyncio.create_task(self._session_transition_loop()),
             asyncio.create_task(self._status_heartbeat_loop()),
+            asyncio.create_task(self._market_snapshot_loop()),
         ]
 
         try:
@@ -765,6 +766,42 @@ class SilverHedgeBot:
                 logger.warning(f"状态心跳发送失败: {e}")
 
             await asyncio.sleep(1800)
+
+    async def _market_snapshot_loop(self):
+        """Emit market snapshot every minute for operator visibility."""
+        while self._running:
+            try:
+                latest = self.data_engine.latest
+                session_type = self.session_mgr.get_session_type().value
+                window = f"{self.signal_engine.sample_count}/{self.signal_engine.window_size}"
+                zscore = self.signal_engine.get_current_zscore()
+
+                if not latest:
+                    logger.info(
+                        "行情快照: latest=N/A "
+                        f"session={session_type} window={window} "
+                        f"data_ready={self.signal_engine.data_ready}"
+                    )
+                else:
+                    spread = (
+                        (latest.ag_price - latest.hl_price_cny_kg) / latest.hl_price_cny_kg * 100
+                        if latest.hl_price_cny_kg > 0 else 0.0
+                    )
+                    logger.info(
+                        "行情快照: "
+                        f"AG={latest.ag_price:.1f} CNY/kg "
+                        f"HL={latest.hl_price_usd:.4f} USD/oz "
+                        f"HL_CNY={latest.hl_price_cny_kg:.1f} CNY/kg "
+                        f"USDCNY={latest.usdcny:.4f} "
+                        f"spread={spread:.3f}% z={zscore:.2f} "
+                        f"window={window} "
+                        f"session={session_type} "
+                        f"stale(ag={latest.ag_stale},hl={latest.hl_stale},fx={latest.forex_stale})"
+                    )
+            except Exception as e:
+                logger.warning(f"行情快照日志异常: {e}")
+
+            await asyncio.sleep(60)
 
     async def shutdown(self):
         """Graceful shutdown."""
