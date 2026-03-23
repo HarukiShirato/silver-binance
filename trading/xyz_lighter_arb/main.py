@@ -6,6 +6,8 @@
 import asyncio
 import signal
 import os
+import csv
+from collections import Counter
 from datetime import datetime
 
 import logging
@@ -23,11 +25,11 @@ logger = logging.getLogger("SilverHedge")
 
 from config import (
     TRADING_PAIRS, STRATEGY, API, RISK, FOREX, NOTIFY, RUNTIME,
-    load_api_keys, load_notify_config, validate_api_keys, load_runtime_config,
+    load_api_keys, load_notify_config, validate_api_keys, load_runtime_config, get_ctp_front_candidates,
 )
 from exchanges import CTPGateway, HyperliquidClient
 from forex_feed import ForexFeed
-from session_manager import SessionManager
+from session_manager import SessionManager, SessionType
 from data_engine import DataEngine, NormalizedPrice
 from signal_engine import SignalEngine, Signal, SignalResult
 from execution_engine import ExecutionEngine
@@ -125,14 +127,19 @@ class SilverHedgeBot:
 
         self._running = False
         self._total_fees_today = 0.0
+        self._last_session_type = None
+        self._decision_stats = Counter()
+        self._trade_log_file = os.path.join("data", "trade_events.csv")
+        self._window_full_notified = False
 
     async def initialize(self):
         """Initialize exchanges and data sources."""
         os.makedirs("logs", exist_ok=True)
         os.makedirs("data", exist_ok=True)
+        self._ensure_trade_log_file()
 
         logger.info("正在连接 CTP 网关...")
-        await self.ctp_gateway.connect()
+        await self._connect_ctp_with_fallback()
 
         if RUNTIME.dry_run:
             logger.info("当前模式: DRY_RUN=true（只跑信号与风控，不发真实下单）")
@@ -168,15 +175,81 @@ class SilverHedgeBot:
             capital=TRADING_PAIRS['SILVER'].capital,
         )
 
+        self._last_session_type = self.session_mgr.get_session_type()
+        if self._last_session_type != SessionType.CLOSED:
+            await self._notify_session_transition("START", self._last_session_type)
+
         logger.info("SilverHedgeBot initialized")
+
+    async def _connect_ctp_with_fallback(self):
+        fronts = get_ctp_front_candidates()
+        if not fronts:
+            raise ConnectionError("未配置可用的 CTP 前置地址")
+
+        last_error: Exception = None
+        total = len(fronts)
+        for idx, (md_front, td_front) in enumerate(fronts, start=1):
+            self.ctp_gateway.md_front = md_front
+            self.ctp_gateway.td_front = td_front
+            logger.info(
+                f"尝试 CTP 前置 [{idx}/{total}] "
+                f"MD={md_front}, TD={td_front}"
+            )
+            try:
+                await self.ctp_gateway.connect()
+                logger.info(f"CTP 已连接, 使用前置: MD={md_front}, TD={td_front}")
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"前置连接失败 [{idx}/{total}] MD={md_front}, TD={td_front}, err={e}"
+                )
+                try:
+                    await self.ctp_gateway.close()
+                except Exception:
+                    pass
+
+        raise ConnectionError(f"所有 CTP 前置连接失败, last_error={last_error}")
 
     async def _on_price(self, price: NormalizedPrice):
         """DataEngine callback: price -> signal -> execution."""
         result = self.signal_engine.update(price)
-        if not result or result.signal == Signal.HOLD:
+        await self._maybe_notify_window_full(price)
+        if not result:
+            self._decision_stats[self.signal_engine.last_decision_reason] += 1
+            return
+
+        if result.signal == Signal.HOLD:
+            self._decision_stats[self.signal_engine.last_decision_reason] += 1
             return
 
         await self._process_signal(result)
+
+    async def _maybe_notify_window_full(self, price: NormalizedPrice):
+        if self._window_full_notified:
+            return
+        if self.signal_engine.sample_count < self.signal_engine.window_size:
+            return
+
+        spread_pct = ((price.ag_price - price.hl_price_cny_kg) / price.hl_price_cny_kg * 100) if price.hl_price_cny_kg > 0 else None
+        zscore = self.signal_engine.get_current_zscore()
+
+        await self.notifier.notify_window_full(
+            pair_name="SILVER",
+            sample_count=self.signal_engine.sample_count,
+            window_size=self.signal_engine.window_size,
+            zscore=zscore,
+            spread_pct=spread_pct,
+            ag_price=price.ag_price,
+            hl_price_usd=price.hl_price_usd,
+            hl_price_cny_kg=price.hl_price_cny_kg,
+            usdcny=price.usdcny,
+        )
+        self._window_full_notified = True
+        logger.info(
+            f"信号窗口已满: {self.signal_engine.sample_count}/{self.signal_engine.window_size}, "
+            f"z={zscore:.2f}, spread={(spread_pct if spread_pct is not None else 0):.3f}%"
+        )
 
     async def _process_signal(self, signal: SignalResult):
         """Handle a trading signal."""
@@ -190,6 +263,7 @@ class SilverHedgeBot:
         can_trade, reason = self.risk_manager.can_trade('SILVER')
         if not can_trade:
             logger.warning(f"交易被阻止: {reason}")
+            self._decision_stats[f"blocked_risk_{reason}"] += 1
             return
 
         # 浠峰樊瀹夊叏妫€鏌?
@@ -198,6 +272,7 @@ class SilverHedgeBot:
         )
         if not safe:
             await self.notifier.notify_emergency(reason)
+            self._decision_stats[f"blocked_spread_{reason}"] += 1
             return
 
         # 璁＄畻鎵嬫暟
@@ -214,6 +289,7 @@ class SilverHedgeBot:
 
         if lots <= 0:
             logger.warning("计算手数为 0，跳过")
+            self._decision_stats["blocked_lots_zero"] += 1
             return
 
         # 璁板綍浜ゆ槗寮€濮?
@@ -262,9 +338,33 @@ class SilverHedgeBot:
                     fees=0,
                     status="filled",
                 )
+                await self.notifier.notify_dry_run_fill(
+                    signal=signal.signal.value,
+                    lots=lots,
+                    zscore=signal.zscore,
+                    spread_pct=signal.spread_pct,
+                    ag_price=signal.ag_price,
+                    hl_price_usd=signal.hl_price_usd_oz,
+                    hl_price_cny_kg=signal.hl_price_cny_kg,
+                    usdcny=signal.usdcny,
+                    position_after=self.signal_engine.position,
+                )
             self.risk_manager.set_cooldown(STRATEGY.cooldown_seconds)
+            self._append_trade_event(
+                signal=signal.signal.value,
+                lots=lots,
+                status="filled",
+                fee_rmb=0.0,
+                reason="dry_run_fill",
+                signal_data=signal,
+            )
             logger.info(
-                f"DRY_RUN 已拦截下单: {signal.signal.value} lots={lots}"
+                "DRY_RUN 成交模拟: "
+                f"signal={signal.signal.value} lots={lots} "
+                f"z={signal.zscore:.2f} spread={signal.spread_pct:.3f}% "
+                f"AG={signal.ag_price:.1f} HL=${signal.hl_price_usd_oz:.4f} "
+                f"HL_CNY={signal.hl_price_cny_kg:.1f} usdcny={signal.usdcny:.4f} "
+                f"position_after={self.signal_engine.position}"
             )
             return
 
@@ -288,6 +388,14 @@ class SilverHedgeBot:
 
                 self.risk_manager.record_trade_result('SILVER', -result.total_fee_rmb, "filled")
                 self._total_fees_today += result.total_fee_rmb
+                self._append_trade_event(
+                    signal=signal.signal.value,
+                    lots=lots,
+                    status="filled",
+                    fee_rmb=result.total_fee_rmb,
+                    reason="live_fill",
+                    signal_data=signal,
+                )
 
                 if NOTIFY.notify_on_trade:
                     await self.notifier.notify_trade_result(
@@ -301,6 +409,15 @@ class SilverHedgeBot:
                     )
             else:
                 self.risk_manager.record_trade_result('SILVER', 0, result.status)
+                self._decision_stats[f"exec_status_{result.status}"] += 1
+                self._append_trade_event(
+                    signal=signal.signal.value,
+                    lots=lots,
+                    status=result.status,
+                    fee_rmb=0.0,
+                    reason=result.error or "live_execute_not_filled",
+                    signal_data=signal,
+                )
                 if NOTIFY.notify_on_error:
                     await self.notifier.notify_error(result.error, 'SILVER')
 
@@ -310,6 +427,15 @@ class SilverHedgeBot:
         except Exception as e:
             logger.error(f"交易执行异常: {e}")
             self.risk_manager.record_trade_result('SILVER', 0, "failed")
+            self._decision_stats["exec_exception"] += 1
+            self._append_trade_event(
+                signal=signal.signal.value,
+                lots=lots,
+                status="failed",
+                fee_rmb=0.0,
+                reason=str(e),
+                signal_data=signal,
+            )
             if NOTIFY.notify_on_error:
                 await self.notifier.notify_error(str(e), 'SILVER')
 
@@ -323,6 +449,8 @@ class SilverHedgeBot:
             asyncio.create_task(self._funding_rate_loop()),
             asyncio.create_task(self._margin_monitor_loop()),
             asyncio.create_task(self._health_monitor_loop()),
+            asyncio.create_task(self._session_transition_loop()),
+            asyncio.create_task(self._status_heartbeat_loop()),
         ]
 
         try:
@@ -501,6 +629,142 @@ class SilverHedgeBot:
                     await self.notifier.notify_emergency(msg)
 
             await asyncio.sleep(60)
+
+    async def _session_transition_loop(self):
+        """Detect trading-session transitions and send Feishu notifications."""
+        while self._running:
+            try:
+                current = self.session_mgr.get_session_type()
+                previous = self._last_session_type
+                self._last_session_type = current
+
+                if previous is None:
+                    await asyncio.sleep(5)
+                    continue
+
+                if previous == SessionType.CLOSED and current != SessionType.CLOSED:
+                    await self._notify_session_transition("START", current)
+                elif previous != SessionType.CLOSED and current == SessionType.CLOSED:
+                    await self._notify_session_transition("END", previous)
+            except Exception as e:
+                logger.warning(f"交易时段切换通知异常: {e}")
+
+            await asyncio.sleep(5)
+
+    async def _notify_session_transition(self, event: str, session_type: SessionType):
+        latest = self.data_engine.latest
+        ag = latest.ag_price if latest else None
+        hl_usd = latest.hl_price_usd if latest else None
+        hl_cny = latest.hl_price_cny_kg if latest else None
+        usdcny = latest.usdcny if latest else None
+
+        await self.notifier.notify_session_transition(
+            event=event,
+            session_type=session_type.value,
+            ag_price=ag,
+            hl_price_usd=hl_usd,
+            hl_price_cny_kg=hl_cny,
+            usdcny=usdcny,
+        )
+
+    def _ensure_trade_log_file(self):
+        if os.path.exists(self._trade_log_file):
+            return
+        with open(self._trade_log_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp",
+                "mode",
+                "pair",
+                "signal",
+                "lots",
+                "status",
+                "fee_rmb",
+                "reason",
+                "ag_price",
+                "hl_price_usd",
+                "hl_price_cny_kg",
+                "usdcny",
+                "spread_pct",
+                "zscore",
+                "position_after",
+            ])
+
+    def _append_trade_event(
+        self,
+        signal: str,
+        lots: float,
+        status: str,
+        fee_rmb: float,
+        reason: str,
+        signal_data: SignalResult,
+    ):
+        row = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "DRY_RUN" if RUNTIME.dry_run else "LIVE",
+            "SILVER",
+            signal,
+            f"{lots:.4f}",
+            status,
+            f"{fee_rmb:.2f}",
+            reason,
+            f"{signal_data.ag_price:.4f}",
+            f"{signal_data.hl_price_usd_oz:.6f}",
+            f"{signal_data.hl_price_cny_kg:.4f}",
+            f"{signal_data.usdcny:.6f}",
+            f"{signal_data.spread_pct:.6f}",
+            f"{signal_data.zscore:.6f}",
+            self.signal_engine.position,
+        ]
+        with open(self._trade_log_file, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+
+    async def _status_heartbeat_loop(self):
+        """Emit status heartbeat every 30 minutes (log + Feishu)."""
+        while self._running:
+            try:
+                latest = self.data_engine.latest
+                session_type = self.session_mgr.get_session_type().value
+                stats_snapshot = dict(self._decision_stats)
+                zscore = self.signal_engine.get_current_zscore()
+
+                ag = latest.ag_price if latest else None
+                hl_usd = latest.hl_price_usd if latest else None
+                hl_cny = latest.hl_price_cny_kg if latest else None
+                usdcny = latest.usdcny if latest else None
+                spread = latest and ((latest.ag_price - latest.hl_price_cny_kg) / latest.hl_price_cny_kg * 100)
+
+                logger.info(
+                    "状态心跳(30m): "
+                    f"mode={'DRY_RUN' if RUNTIME.dry_run else 'LIVE'} "
+                    f"session={session_type} "
+                    f"data_ready={self.signal_engine.data_ready} "
+                    f"window={self.signal_engine.sample_count}/{self.signal_engine.window_size} "
+                    f"z={zscore:.2f} spread={(spread if spread is not None else 0):.3f}% "
+                    f"AG={(ag if ag is not None else 0):.1f} HL={(hl_usd if hl_usd is not None else 0):.4f} "
+                    f"decisions_30m={stats_snapshot}"
+                )
+
+                await self.notifier.notify_status_heartbeat(
+                    mode="DRY_RUN" if RUNTIME.dry_run else "LIVE",
+                    session_type=session_type,
+                    data_ready=self.signal_engine.data_ready,
+                    sample_count=self.signal_engine.sample_count,
+                    window_size=self.signal_engine.window_size,
+                    zscore=zscore,
+                    spread_pct=spread,
+                    ag_price=ag,
+                    hl_price_usd=hl_usd,
+                    hl_price_cny_kg=hl_cny,
+                    usdcny=usdcny,
+                    decision_stats=stats_snapshot,
+                )
+
+                self._decision_stats.clear()
+            except Exception as e:
+                logger.warning(f"状态心跳发送失败: {e}")
+
+            await asyncio.sleep(1800)
 
     async def shutdown(self):
         """Graceful shutdown."""
