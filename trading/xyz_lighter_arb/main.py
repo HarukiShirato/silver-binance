@@ -33,6 +33,7 @@ from session_manager import SessionManager, SessionType
 from data_engine import DataEngine, NormalizedPrice
 from signal_engine import SignalEngine, Signal, SignalResult
 from execution_engine import ExecutionEngine
+from remote_hl_executor import RemoteHLExecutorClient
 from risk_manager import RiskManager
 from position_manager import PositionManager, MarginLevel
 from notifier import FeishuNotifier
@@ -125,6 +126,12 @@ class SilverHedgeBot:
             notifier=self.notifier,
             leg_timeout_sec=RISK.leg_timeout_sec,
         )
+        self.remote_hl_executor = None
+        if RUNTIME.hl_exec_mode == "remote" and RUNTIME.hl_remote_url:
+            self.remote_hl_executor = RemoteHLExecutorClient(
+                base_url=RUNTIME.hl_remote_url,
+                timeout_sec=RUNTIME.remote_exec_timeout_sec,
+            )
 
         self._running = False
         self._total_fees_today = 0.0
@@ -147,6 +154,17 @@ class SilverHedgeBot:
 
         logger.info("正在缓存 HL asset_id...")
         await self.hl_client._ensure_asset_ids()
+
+        if self.remote_hl_executor is not None:
+            health = self.remote_hl_executor.health_check()
+            if health.ok:
+                logger.info(
+                    f"远程HL网关探活成功: code={health.status_code} latency={health.latency_ms:.1f}ms"
+                )
+            else:
+                logger.warning(
+                    f"远程HL网关探活失败: code={health.status_code} latency={health.latency_ms:.1f}ms detail={health.detail}"
+                )
 
         restored = self.signal_engine.load_window_state(load_points=20)
         if restored > 0:
@@ -330,6 +348,31 @@ class SilverHedgeBot:
             else:
                 self.position_manager.on_close(lots)
                 self.signal_engine.reset_funding()
+
+            if self.remote_hl_executor is not None:
+                signal_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{signal.signal.value}-{lots}"
+                remote_payload = {
+                    "signal_id": signal_id,
+                    "signal": signal.signal.value,
+                    "symbol": TRADING_PAIRS['SILVER'].hl_symbol,
+                    "lots": lots,
+                    "hl_size_oz": lots * TRADING_PAIRS['SILVER'].ctp_multiplier / 0.0311035,
+                    "ag_price": signal.ag_price,
+                    "hl_price_usd": signal.hl_price_usd_oz,
+                    "usdcny": signal.usdcny,
+                    "spread_pct": signal.spread_pct,
+                    "zscore": signal.zscore,
+                    "ts": signal.timestamp,
+                }
+                remote_result = self.remote_hl_executor.send_dry_run(remote_payload)
+                if remote_result.ok:
+                    logger.info(
+                        f"远程HL执行回执 OK: code={remote_result.status_code} latency={remote_result.latency_ms:.1f}ms"
+                    )
+                else:
+                    logger.warning(
+                        f"远程HL执行回执失败: code={remote_result.status_code} latency={remote_result.latency_ms:.1f}ms detail={remote_result.detail}"
+                    )
 
             self.risk_manager.save_position_state(
                 pair_name='SILVER',

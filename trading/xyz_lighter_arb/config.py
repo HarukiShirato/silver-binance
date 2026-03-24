@@ -56,7 +56,7 @@ class StrategyConfig:
     sample_interval: int = 30       # 采样间隔 (秒), 每30秒取一个数据点
 
     # 仓位管理
-    max_position_lots: int = 10     # 最大持仓手数 (逐手加仓, 每次+1手)
+    max_position_lots: int = 1      # 最大持仓手数 (最小模式: 仅1手)
 
     # 时间控制
     max_hold_hours: int = 24        # 最大持仓时间
@@ -108,6 +108,9 @@ API = APIConfig()
 @dataclass
 class RuntimeConfig:
     dry_run: bool = True
+    hl_exec_mode: str = "local"          # local | remote
+    hl_remote_url: str = ""              # e.g. http://52.193.85.209:18080
+    remote_exec_timeout_sec: float = 2.0
 
 
 RUNTIME = RuntimeConfig()
@@ -115,6 +118,14 @@ RUNTIME = RuntimeConfig()
 
 def load_runtime_config():
     RUNTIME.dry_run = _env_bool("DRY_RUN", True)
+    RUNTIME.hl_exec_mode = os.environ.get("HL_EXEC_MODE", RUNTIME.hl_exec_mode).strip().lower()
+    RUNTIME.hl_remote_url = os.environ.get("HL_REMOTE_URL", RUNTIME.hl_remote_url).strip()
+    timeout = os.environ.get("REMOTE_EXEC_TIMEOUT_SEC")
+    if timeout:
+        try:
+            RUNTIME.remote_exec_timeout_sec = float(timeout)
+        except ValueError:
+            pass
 
 
 def load_api_keys():
