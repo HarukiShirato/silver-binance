@@ -7,10 +7,12 @@ import asyncio
 import signal
 import os
 import csv
+import uuid
 from collections import Counter
 from datetime import datetime
 
 import logging
+from logging.handlers import RotatingFileHandler
 # 纭繚鏃ュ織鐩綍鍦?FileHandler 鍒濆鍖栧墠瀛樺湪
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -18,7 +20,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("logs/hedge.log"),
+        RotatingFileHandler("logs/hedge.log", maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"),
     ]
 )
 logger = logging.getLogger("SilverHedge")
@@ -139,12 +141,15 @@ class SilverHedgeBot:
         self._decision_stats = Counter()
         self._trade_log_file = os.path.join("data", "trade_events.csv")
         self._window_full_notified = False
+        self._last_remote_ok_ts = ""
+        self._last_remote_err = ""
 
     async def initialize(self):
         """Initialize exchanges and data sources."""
         os.makedirs("logs", exist_ok=True)
         os.makedirs("data", exist_ok=True)
         self._ensure_trade_log_file()
+        self._log_runtime_config()
 
         logger.info("正在连接 CTP 网关...")
         await self._connect_ctp_with_fallback()
@@ -207,6 +212,19 @@ class SilverHedgeBot:
             await self._notify_session_transition("START", self._last_session_type)
 
         logger.info("SilverHedgeBot initialized")
+
+    def _log_runtime_config(self):
+        pair = TRADING_PAIRS['SILVER']
+        logger.info(
+            "运行配置摘要: "
+            f"mode={'DRY_RUN' if RUNTIME.dry_run else 'LIVE'} "
+            f"hl_exec_mode={RUNTIME.hl_exec_mode} "
+            f"hl_remote_url={RUNTIME.hl_remote_url or 'N/A'} "
+            f"entry_z={STRATEGY.entry_zscore} exit_z={STRATEGY.exit_zscore} stop_z={STRATEGY.stop_loss_zscore} "
+            f"window={STRATEGY.spread_window} sample_interval={STRATEGY.sample_interval}s "
+            f"max_lots={STRATEGY.max_position_lots} emergency_spread_pct={RISK.emergency_spread_pct} "
+            f"ctp_instrument={pair.ctp_instrument} hl_symbol={pair.hl_symbol}"
+        )
 
     async def _connect_ctp_with_fallback(self):
         fronts = get_ctp_front_candidates()
@@ -280,8 +298,9 @@ class SilverHedgeBot:
 
     async def _process_signal(self, signal: SignalResult):
         """Handle a trading signal."""
+        signal_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{signal.signal.value}-{uuid.uuid4().hex[:8]}"
         logger.info(
-            f"信号: {signal.signal.value} | "
+            f"信号[{signal_id}]: {signal.signal.value} | "
             f"AG={signal.ag_price:.1f} CNY/kg HL=${signal.hl_price_usd_oz:.4f} | "
             f"spread={signal.spread_pct:.3f}% zscore={signal.zscore:.2f}"
         )
@@ -291,6 +310,15 @@ class SilverHedgeBot:
         if not can_trade:
             logger.warning(f"交易被阻止: {reason}")
             self._decision_stats[f"blocked_risk_{reason}"] += 1
+            self._append_trade_event(
+                signal=signal.signal.value,
+                lots=0,
+                status="blocked",
+                fee_rmb=0.0,
+                reason=f"risk:{reason}",
+                signal_data=signal,
+                signal_id=signal_id,
+            )
             return
 
         # 浠峰樊瀹夊叏妫€鏌?
@@ -300,6 +328,15 @@ class SilverHedgeBot:
         if not safe:
             await self.notifier.notify_emergency(reason)
             self._decision_stats[f"blocked_spread_{reason}"] += 1
+            self._append_trade_event(
+                signal=signal.signal.value,
+                lots=0,
+                status="blocked",
+                fee_rmb=0.0,
+                reason=f"spread:{reason}",
+                signal_data=signal,
+                signal_id=signal_id,
+            )
             return
 
         # 璁＄畻鎵嬫暟
@@ -317,6 +354,15 @@ class SilverHedgeBot:
         if lots <= 0:
             logger.warning("计算手数为 0，跳过")
             self._decision_stats["blocked_lots_zero"] += 1
+            self._append_trade_event(
+                signal=signal.signal.value,
+                lots=0,
+                status="blocked",
+                fee_rmb=0.0,
+                reason="lots_zero",
+                signal_data=signal,
+                signal_id=signal_id,
+            )
             return
 
         # 璁板綍浜ゆ槗寮€濮?
@@ -350,7 +396,6 @@ class SilverHedgeBot:
                 self.signal_engine.reset_funding()
 
             if self.remote_hl_executor is not None:
-                signal_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{signal.signal.value}-{lots}"
                 remote_payload = {
                     "signal_id": signal_id,
                     "signal": signal.signal.value,
@@ -366,12 +411,15 @@ class SilverHedgeBot:
                 }
                 remote_result = self.remote_hl_executor.send_dry_run(remote_payload)
                 if remote_result.ok:
+                    self._last_remote_ok_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self._last_remote_err = ""
                     logger.info(
-                        f"远程HL执行回执 OK: code={remote_result.status_code} latency={remote_result.latency_ms:.1f}ms"
+                        f"远程HL执行回执 OK: signal_id={signal_id} code={remote_result.status_code} latency={remote_result.latency_ms:.1f}ms"
                     )
                 else:
+                    self._last_remote_err = f"code={remote_result.status_code} detail={remote_result.detail}"
                     logger.warning(
-                        f"远程HL执行回执失败: code={remote_result.status_code} latency={remote_result.latency_ms:.1f}ms detail={remote_result.detail}"
+                        f"远程HL执行回执失败: signal_id={signal_id} code={remote_result.status_code} latency={remote_result.latency_ms:.1f}ms detail={remote_result.detail}"
                     )
 
             self.risk_manager.save_position_state(
@@ -409,6 +457,7 @@ class SilverHedgeBot:
                 fee_rmb=0.0,
                 reason="dry_run_fill",
                 signal_data=signal,
+                signal_id=signal_id,
             )
             logger.info(
                 "DRY_RUN 成交模拟: "
@@ -447,6 +496,7 @@ class SilverHedgeBot:
                     fee_rmb=result.total_fee_rmb,
                     reason="live_fill",
                     signal_data=signal,
+                    signal_id=signal_id,
                 )
 
                 if NOTIFY.notify_on_trade:
@@ -469,6 +519,7 @@ class SilverHedgeBot:
                     fee_rmb=0.0,
                     reason=result.error or "live_execute_not_filled",
                     signal_data=signal,
+                    signal_id=signal_id,
                 )
                 if NOTIFY.notify_on_error:
                     await self.notifier.notify_error(result.error, 'SILVER')
@@ -487,6 +538,7 @@ class SilverHedgeBot:
                 fee_rmb=0.0,
                 reason=str(e),
                 signal_data=signal,
+                signal_id=signal_id,
             )
             if NOTIFY.notify_on_error:
                 await self.notifier.notify_error(str(e), 'SILVER')
@@ -728,12 +780,15 @@ class SilverHedgeBot:
             writer.writerow([
                 "timestamp",
                 "mode",
+                "signal_id",
                 "pair",
                 "signal",
                 "lots",
                 "status",
                 "fee_rmb",
                 "reason",
+                "remote_last_ok_ts",
+                "remote_last_err",
                 "ag_price",
                 "hl_price_usd",
                 "hl_price_cny_kg",
@@ -751,16 +806,20 @@ class SilverHedgeBot:
         fee_rmb: float,
         reason: str,
         signal_data: SignalResult,
+        signal_id: str = "",
     ):
         row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "DRY_RUN" if RUNTIME.dry_run else "LIVE",
+            signal_id,
             "SILVER",
             signal,
             f"{lots:.4f}",
             status,
             f"{fee_rmb:.2f}",
             reason,
+            self._last_remote_ok_ts,
+            self._last_remote_err,
             f"{signal_data.ag_price:.4f}",
             f"{signal_data.hl_price_usd_oz:.6f}",
             f"{signal_data.hl_price_cny_kg:.4f}",
@@ -795,7 +854,9 @@ class SilverHedgeBot:
                     f"window={self.signal_engine.sample_count}/{self.signal_engine.window_size} "
                     f"z={zscore:.2f} spread={(spread if spread is not None else 0):.3f}% "
                     f"AG={(ag if ag is not None else 0):.1f} HL={(hl_usd if hl_usd is not None else 0):.4f} "
-                    f"decisions_30m={stats_snapshot}"
+                    f"decisions_30m={stats_snapshot} "
+                    f"remote_last_ok={self._last_remote_ok_ts or 'N/A'} "
+                    f"remote_last_err={self._last_remote_err or 'N/A'}"
                 )
 
                 await self.notifier.notify_status_heartbeat(
