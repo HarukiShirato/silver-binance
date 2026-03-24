@@ -1,18 +1,6 @@
-# signal_engine.py - Layer 2: 信号引擎
-#
-# 百分比价差 → 滚动 Z-score → 交易信号
-# 公式来自 backtest/silver/spread_backtest_1m.py:
-#   spread_pct = (ag_price - hl_cny_price) / hl_cny_price * 100
-#
-# 采样方式: 每 sample_interval 秒取一个数据点加入滚动窗口,
-#   与回测中1分钟K线的统计特性保持一致.
-#   中间的 tick 仍然实时计算 z-score 用于信号判断, 但不写入窗口.
-#
-# 信号方向:
-#   LONG  = 做多价差 = 买AG + 卖HL (AG 便宜时)
-#   SHORT = 做空价差 = 卖AG + 买HL (AG 贵时)
-
-import time
+import json
+import logging
+import os
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -23,41 +11,34 @@ import numpy as np
 from data_engine import NormalizedPrice
 from session_manager import SessionManager
 
-import logging
 logger = logging.getLogger(__name__)
 
 
 class Signal(str, Enum):
-    LONG = "LONG"                # 买AG, 卖HL
-    SHORT = "SHORT"              # 卖AG, 买HL
-    EXIT_LONG = "EXIT_LONG"      # 平多: 卖AG, 买HL
-    EXIT_SHORT = "EXIT_SHORT"    # 平空: 买AG, 卖HL
+    LONG = "LONG"
+    SHORT = "SHORT"
+    EXIT_LONG = "EXIT_LONG"
+    EXIT_SHORT = "EXIT_SHORT"
     HOLD = "HOLD"
 
 
 @dataclass
 class SignalResult:
-    """信号结果"""
     signal: Signal
-    # 价格
-    ag_price: float              # RMB/kg
-    hl_price_cny_kg: float       # 换算后 RMB/kg
-    hl_price_usd_oz: float       # 原始 USD/oz
+    ag_price: float
+    hl_price_cny_kg: float
+    hl_price_usd_oz: float
     usdcny: float
-    # 价差统计
-    spread_pct: float            # (ag - hl_cny) / hl_cny * 100
+    spread_pct: float
     spread_mean: float
     spread_std: float
     zscore: float
-    # 其他
     funding_rate: float
     timestamp: float
 
 
 class SignalEngine:
-    """价差信号引擎 (按时间采样, 与回测1分钟K线对齐)"""
-
-    MIN_DATA_POINTS = 30  # 最少需要的数据点才开始出信号
+    MIN_DATA_POINTS = 30
 
     def __init__(
         self,
@@ -74,26 +55,21 @@ class SignalEngine:
         self._entry_z = entry_zscore
         self._exit_z = exit_zscore
         self._stop_z = stop_loss_zscore
-        self._sample_interval = sample_interval  # 采样间隔 (秒)
+        self._sample_interval = sample_interval
         self._session_mgr = session_manager
 
-        # 滚动窗口 (按时间采样的数据点)
         self._spread_pcts: deque = deque(maxlen=window_size)
+        self._last_sample_time: float = 0.0
+        self._latest_spread_pct: float = 0.0
+        self._cached_mean: float = 0.0
+        self._cached_std: float = 0.0
 
-        # 采样控制
-        self._last_sample_time: float = 0  # 上次采样时间戳
-        self._latest_spread_pct: float = 0  # 当前最新价差 (用于采样时写入窗口)
+        self._position: str = "NONE"
+        self._last_funding_rate: float = 0.0
+        self._cumulative_funding: float = 0.0
+        self._last_decision_reason: str = "init"
 
-        # 缓存的统计量 (避免每个 tick 都重新计算)
-        self._cached_mean: float = 0
-        self._cached_std: float = 0
-
-        # 当前持仓方向
-        self._position: str = "NONE"  # NONE, LONG, SHORT
-
-        # Funding rate 跟踪
-        self._last_funding_rate: float = 0
-        self._cumulative_funding: float = 0
+        self._state_file = os.path.join("data", "signal_window_state.json")
 
     @property
     def position(self) -> str:
@@ -103,61 +79,90 @@ class SignalEngine:
     def data_ready(self) -> bool:
         return len(self._spread_pcts) >= self.MIN_DATA_POINTS
 
+    @property
+    def sample_count(self) -> int:
+        return len(self._spread_pcts)
+
+    @property
+    def window_size(self) -> int:
+        return self._window_size
+
+    @property
+    def last_decision_reason(self) -> str:
+        return self._last_decision_reason
+
+    def load_window_state(self, load_points: int = 20) -> int:
+        """Load the latest N samples from disk for warm-start."""
+        if not os.path.exists(self._state_file):
+            return 0
+        try:
+            with open(self._state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            items = data.get("spread_pcts", [])
+            if not isinstance(items, list):
+                return 0
+            n = max(0, min(int(load_points), self._window_size))
+            restored = items[-n:] if n > 0 else []
+            self._spread_pcts.clear()
+            for x in restored:
+                self._spread_pcts.append(float(x))
+            self._last_sample_time = float(data.get("last_sample_time", 0.0) or 0.0)
+            if self._spread_pcts:
+                self._latest_spread_pct = float(self._spread_pcts[-1])
+            self._update_stats()
+            return len(self._spread_pcts)
+        except Exception as e:
+            logger.warning(f"加载信号窗口状态失败: {e}")
+            return 0
+
+    def save_window_state(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
+            payload = {
+                "pair_name": self._pair_name,
+                "spread_pcts": list(self._spread_pcts),
+                "last_sample_time": self._last_sample_time,
+            }
+            with open(self._state_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存信号窗口状态失败: {e}")
+
     def update(self, price: NormalizedPrice) -> Optional[SignalResult]:
-        """
-        接收 NormalizedPrice, 计算价差和信号
-
-        采样逻辑:
-        - 每个 tick 都实时计算 spread_pct 和 zscore (用于信号判断)
-        - 但只有每隔 sample_interval 秒才将一个数据点写入滚动窗口
-        - 这样 window=60 + interval=60s = 60分钟窗口, 与回测一致
-
-        Returns:
-            SignalResult 或 None (数据不足或非交易时段)
-        """
-        # 检查交易时段
         if self._session_mgr and not self._session_mgr.is_trading_time():
+            self._last_decision_reason = "session_closed"
             return None
 
-        # 价格有效性
         if price.ag_price <= 0 or price.hl_price_cny_kg <= 0:
+            self._last_decision_reason = "invalid_price"
             return None
 
-        # 跳过过期数据
         if price.ag_stale or price.hl_stale:
-            logger.debug("价格数据过期, 跳过信号生成")
+            self._last_decision_reason = "stale_price"
             return None
 
-        # 汇率过期时只允许平仓信号, 禁止开新仓
         if price.forex_stale and self._position == "NONE":
-            logger.warning("汇率过期, 禁止开新仓")
+            self._last_decision_reason = "forex_stale_no_entry"
             return None
 
-        # 百分比价差: (AG - HL_CNY) / HL_CNY * 100
-        spread_pct = (price.ag_price - price.hl_price_cny_kg) / price.hl_price_cny_kg * 100
+        spread_pct = (price.ag_price - price.hl_price_cny_kg) / price.hl_price_cny_kg * 100.0
         self._latest_spread_pct = spread_pct
 
-        # === 按时间采样: 每 sample_interval 秒写入一个数据点 ===
-        now = price.timestamp
-        if self._last_sample_time == 0:
-            # 首次: 直接采样
-            self._spread_pcts.append(spread_pct)
-            self._last_sample_time = now
-            self._update_stats()
-            logger.info(f"首次采样, spread_pct={spread_pct:.4f}%, 窗口大小={len(self._spread_pcts)}")
+        now = float(price.timestamp)
+        should_sample = False
+        if self._last_sample_time == 0.0:
+            should_sample = True
         elif (now - self._last_sample_time) >= self._sample_interval:
-            # 到达采样间隔: 将最新价差写入窗口
+            should_sample = True
+
+        if should_sample:
             self._spread_pcts.append(spread_pct)
             self._last_sample_time = now
             self._update_stats()
-            logger.debug(
-                f"采样: spread_pct={spread_pct:.4f}%, "
-                f"窗口={len(self._spread_pcts)}/{self._window_size}, "
-                f"mean={self._cached_mean:.4f}%, std={self._cached_std:.4f}%"
-            )
+            self.save_window_state()
 
-        # 数据不足
         if not self.data_ready:
+            self._last_decision_reason = "warmup"
             return SignalResult(
                 signal=Signal.HOLD,
                 ag_price=price.ag_price,
@@ -167,16 +172,14 @@ class SignalEngine:
                 spread_pct=spread_pct,
                 spread_mean=self._cached_mean,
                 spread_std=self._cached_std,
-                zscore=0,
+                zscore=0.0,
                 funding_rate=self._last_funding_rate,
                 timestamp=price.timestamp,
             )
 
-        # 实时计算 Z-score (用窗口的 mean/std, 但用当前最新 spread_pct)
-        zscore = (spread_pct - self._cached_mean) / self._cached_std if self._cached_std > 1e-8 else 0
-
-        # 生成信号
+        zscore = (spread_pct - self._cached_mean) / self._cached_std if self._cached_std > 1e-8 else 0.0
         signal = self._generate_signal(zscore)
+        self._last_decision_reason = f"signal_{signal.value.lower()}"
 
         return SignalResult(
             signal=signal,
@@ -192,38 +195,24 @@ class SignalEngine:
             timestamp=price.timestamp,
         )
 
-    def _update_stats(self):
-        """更新缓存的统计量 (仅在新数据点采样时调用)"""
+    def _update_stats(self) -> None:
         if len(self._spread_pcts) < 2:
-            self._cached_mean = self._spread_pcts[0] if self._spread_pcts else 0
-            self._cached_std = 0
+            self._cached_mean = self._spread_pcts[0] if self._spread_pcts else 0.0
+            self._cached_std = 0.0
             return
-        arr = np.array(self._spread_pcts)
+        arr = np.array(self._spread_pcts, dtype=float)
         self._cached_mean = float(np.mean(arr))
         self._cached_std = float(np.std(arr))
 
     def _generate_signal(self, zscore: float) -> Signal:
-        """
-        根据 Z-score 生成交易信号
-
-        zscore > 0: AG 相对 HL 偏贵
-        zscore < 0: AG 相对 HL 偏便宜
-
-        LONG  (zscore << -entry): AG便宜 → 买AG, 卖HL → 等价差回归
-        SHORT (zscore >> +entry): AG贵   → 卖AG, 买HL → 等价差回归
-        """
-        # 止损
         if self._position == "LONG" and zscore < -self._stop_z:
-            logger.warning(f"止损平多, zscore={zscore:.2f}")
             self._position = "NONE"
             return Signal.EXIT_LONG
 
         if self._position == "SHORT" and zscore > self._stop_z:
-            logger.warning(f"止损平空, zscore={zscore:.2f}")
             self._position = "NONE"
             return Signal.EXIT_SHORT
 
-        # 出场 (价差均值回归)
         if self._position == "LONG" and zscore >= -self._exit_z:
             self._position = "NONE"
             return Signal.EXIT_LONG
@@ -232,16 +221,12 @@ class SignalEngine:
             self._position = "NONE"
             return Signal.EXIT_SHORT
 
-        # 入场 (仅在空仓时)
         if self._position == "NONE":
-            # 临近收盘不开新仓
             if self._session_mgr and self._session_mgr.is_near_boundary():
                 return Signal.HOLD
-
             if zscore < -self._entry_z:
                 self._position = "LONG"
                 return Signal.LONG
-
             if zscore > self._entry_z:
                 self._position = "SHORT"
                 return Signal.SHORT
@@ -249,28 +234,23 @@ class SignalEngine:
         return Signal.HOLD
 
     def update_funding_rate(self, rate: float):
-        """更新 HL funding rate"""
         self._last_funding_rate = rate
-        # 如果持仓中, 累计 funding 成本
         if self._position != "NONE":
             self._cumulative_funding += rate
 
     def set_position(self, position: str):
-        """恢复持仓状态 (重启后)"""
         self._position = position
 
     def reset_funding(self):
-        """重置 funding 累计"""
-        self._cumulative_funding = 0
+        self._cumulative_funding = 0.0
 
     @property
     def cumulative_funding(self) -> float:
         return self._cumulative_funding
 
     def get_current_zscore(self) -> float:
-        """获取最新 Z-score"""
         if not self.data_ready:
-            return 0
+            return 0.0
         if self._cached_std < 1e-8:
-            return 0
+            return 0.0
         return (self._latest_spread_pct - self._cached_mean) / self._cached_std

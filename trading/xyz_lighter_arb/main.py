@@ -148,6 +148,14 @@ class SilverHedgeBot:
         logger.info("正在缓存 HL asset_id...")
         await self.hl_client._ensure_asset_ids()
 
+        restored = self.signal_engine.load_window_state(load_points=20)
+        if restored > 0:
+            logger.info(
+                f"已恢复信号窗口样本: {restored}/{self.signal_engine.window_size} (warm start)"
+            )
+            if self.signal_engine.sample_count >= self.signal_engine.window_size:
+                self._window_full_notified = True
+
         # 鍔犺浇椋庢帶鐘舵€?
         self.risk_manager.load_state()
 
@@ -815,6 +823,7 @@ class SilverHedgeBot:
             direction=self.signal_engine.position,
             lots=self.position_manager.current_lots,
         )
+        self.signal_engine.save_window_state()
         self.risk_manager.save_state()
 
         await self.data_engine.stop()
