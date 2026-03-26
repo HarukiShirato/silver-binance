@@ -76,7 +76,8 @@ class APIConfig:
     hl_api_url: str = "https://api.hyperliquid.xyz"
     hl_ws_url: str = "wss://api.hyperliquid.xyz/ws"
     hl_dex: str = "xyz"
-    hl_private_key: str = ""
+    # HL signer key: 推荐使用 API wallet(代理钱包)私钥，而不是主钱包私钥
+    hl_api_wallet_private_key: str = ""
     hl_wallet_address: str = ""
 
     # CTP (国贸期货)
@@ -132,7 +133,7 @@ def load_api_keys():
     """从环境变量加载敏感信息"""
     # Hyperliquid
     API.hl_dex = os.environ.get('HL_DEX', API.hl_dex)
-    API.hl_private_key = os.environ.get('HL_PRIVATE_KEY', '')
+    API.hl_api_wallet_private_key = os.environ.get('HL_API_WALLET_PRIVATE_KEY', '').strip()
     API.hl_wallet_address = os.environ.get('HL_WALLET_ADDRESS', '')
     # CTP
     API.ctp_user_id = os.environ.get('CTP_USER_ID', '')
@@ -179,8 +180,8 @@ def validate_api_keys(dry_run: bool = False):
     if not API.ctp_auth_code:
         missing.append('CTP_AUTH_CODE')
     if not dry_run:
-        if not API.hl_private_key:
-            missing.append('HL_PRIVATE_KEY')
+        if not API.hl_api_wallet_private_key:
+            missing.append('HL_API_WALLET_PRIVATE_KEY')
         if not API.hl_wallet_address:
             missing.append('HL_WALLET_ADDRESS')
     if missing:
@@ -220,7 +221,8 @@ RISK = RiskConfig()
 # ==================== 通知配置 ====================
 @dataclass
 class NotifyConfig:
-    feishu_webhook_url: str = ""
+    feishu_trade_webhook_url: str = ""
+    feishu_margin_webhook_url: str = ""
     enable_feishu: bool = True
     notify_on_trade: bool = True
     notify_on_error: bool = True
@@ -231,7 +233,12 @@ NOTIFY = NotifyConfig()
 
 
 def load_notify_config():
-    NOTIFY.feishu_webhook_url = os.environ.get('FEISHU_WEBHOOK_URL', '')
+    # 兼容旧变量 FEISHU_WEBHOOK_URL -> trade webhook
+    trade = os.environ.get('FEISHU_TRADE_WEBHOOK_URL', '').strip()
+    if not trade:
+        trade = os.environ.get('FEISHU_WEBHOOK_URL', '').strip()
+    NOTIFY.feishu_trade_webhook_url = trade
+    NOTIFY.feishu_margin_webhook_url = os.environ.get('FEISHU_MARGIN_WEBHOOK_URL', '').strip()
 
 
 # ==================== 日志配置 ====================

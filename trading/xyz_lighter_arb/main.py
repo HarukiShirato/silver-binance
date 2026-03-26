@@ -8,6 +8,7 @@ import signal
 import os
 import csv
 import uuid
+import time
 from collections import Counter
 from datetime import datetime
 
@@ -66,7 +67,7 @@ class SilverHedgeBot:
             api_url=API.hl_api_url,
             ws_url=API.hl_ws_url,
             dex=API.hl_dex,
-            private_key=API.hl_private_key,
+            private_key=API.hl_api_wallet_private_key,
             wallet_address=API.hl_wallet_address,
         )
 
@@ -116,7 +117,11 @@ class SilverHedgeBot:
 
         # 閫氱煡
         self.notifier = FeishuNotifier(
-            webhook_url=NOTIFY.feishu_webhook_url,
+            webhook_url=NOTIFY.feishu_trade_webhook_url,
+            enabled=NOTIFY.enable_feishu,
+        )
+        self.margin_notifier = FeishuNotifier(
+            webhook_url=NOTIFY.feishu_margin_webhook_url or NOTIFY.feishu_trade_webhook_url,
             enabled=NOTIFY.enable_feishu,
         )
 
@@ -143,6 +148,7 @@ class SilverHedgeBot:
         self._window_full_notified = False
         self._last_remote_ok_ts = ""
         self._last_remote_err = ""
+        self._margin_risk_last_notified = {"CTP": 0.0, "HL": 0.0}
 
     async def initialize(self):
         """Initialize exchanges and data sources."""
@@ -583,11 +589,10 @@ class SilverHedgeBot:
             except Exception as e:
                 logger.warning(f"CTP 保证金查询失败: {e}")
 
-            if not RUNTIME.dry_run:
-                try:
-                    await self._check_hl_margin()
-                except Exception as e:
-                    logger.warning(f"HL 保证金查询失败: {e}")
+            try:
+                await self._check_hl_margin()
+            except Exception as e:
+                logger.warning(f"HL 保证金查询失败: {e}")
 
             await asyncio.sleep(interval)
 
@@ -608,9 +613,13 @@ class SilverHedgeBot:
             unrealized_pnl=acct.profit,
         )
 
-        # 绛夌骇鍗囬珮(鎭跺寲)鏃跺彂椋炰功閫氱煡
-        if new_level != old_level and new_level != MarginLevel.NORMAL:
-            await self.notifier.notify_margin_warning(
+        # 等级变化时通知一次；DANGER/CRITICAL 持续状态每60秒重复告警
+        should_notify = (
+            (new_level != old_level and new_level != MarginLevel.NORMAL)
+            or self._should_repeat_margin_alert("CTP", new_level)
+        )
+        if should_notify:
+            await self.margin_notifier.notify_margin_warning(
                 account_name="CTP",
                 level=new_level,
                 margin_ratio=self.position_manager.ctp_margin.margin_ratio,
@@ -621,6 +630,8 @@ class SilverHedgeBot:
 
     async def _check_hl_margin(self):
         """Query HL account and update margin state."""
+        if not API.hl_wallet_address:
+            return
         state = await self.hl_client.get_user_state()
         if not state:
             return
@@ -645,9 +656,13 @@ class SilverHedgeBot:
             unrealized_pnl=unrealized_pnl,
         )
 
-        # 绛夌骇鍗囬珮(鎭跺寲)鏃跺彂椋炰功閫氱煡
-        if new_level != old_level and new_level != MarginLevel.NORMAL:
-            await self.notifier.notify_margin_warning(
+        # 等级变化时通知一次；DANGER/CRITICAL 持续状态每60秒重复告警
+        should_notify = (
+            (new_level != old_level and new_level != MarginLevel.NORMAL)
+            or self._should_repeat_margin_alert("HL", new_level)
+        )
+        if should_notify:
+            await self.margin_notifier.notify_margin_warning(
                 account_name="HL",
                 level=new_level,
                 margin_ratio=self.position_manager.hl_margin.margin_ratio,
@@ -655,6 +670,20 @@ class SilverHedgeBot:
                 balance=account_value,
                 available=withdrawable,
             )
+
+    def _should_repeat_margin_alert(self, account_name: str, level: str) -> bool:
+        """DANGER/CRITICAL level repeats every 60s; reset timer once risk is cleared."""
+        if level in (MarginLevel.DANGER, MarginLevel.CRITICAL):
+            now = time.time()
+            last = self._margin_risk_last_notified.get(account_name, 0.0)
+            if now - last >= 60:
+                self._margin_risk_last_notified[account_name] = now
+                return True
+            return False
+
+        # NORMAL/WARNING: clear repeat timer
+        self._margin_risk_last_notified[account_name] = 0.0
+        return False
 
     async def _save_state_loop(self):
         """Persist runtime state every minute."""
@@ -934,6 +963,7 @@ class SilverHedgeBot:
         await self.ctp_gateway.close()
         await self.hl_client.close()
         await self.notifier.close()
+        await self.margin_notifier.close()
 
         logger.info("关闭完成")
 
