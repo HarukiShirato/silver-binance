@@ -47,20 +47,20 @@ TRADING_PAIRS: Dict[str, TradingPair] = {
 @dataclass
 class StrategyConfig:
     # 入场/出场阈值 (来自 spread_backtest_1m.py 最优参数扫描)
-    entry_zscore: float = 1.5       # Z-score入场阈值 (原2.5, 回测最优1.5)
-    exit_zscore: float = 0.5        # Z-score出场阈值
+    entry_zscore: float = 2.4       # Z-score入场阈值 (提高阈值, 减少低优势交易)
+    exit_zscore: float = 0.8        # Z-score出场阈值
     stop_loss_zscore: float = 4.0   # 止损阈值
 
     # 价差计算窗口
     spread_window: int = 60         # 滚动窗口大小 (分钟, 原240 tick)
-    sample_interval: int = 30       # 采样间隔 (秒), 每30秒取一个数据点
+    sample_interval: int = 45       # 采样间隔 (秒)
 
     # 仓位管理
     max_position_lots: int = 1      # 最大持仓手数 (最小模式: 仅1手)
 
     # 时间控制
     max_hold_hours: int = 24        # 最大持仓时间
-    cooldown_seconds: int = 60      # 交易后冷却时间
+    cooldown_seconds: int = 180      # 交易后冷却时间
 
     # 滑点保护
     max_slippage_pct: float = 0.1   # 最大允许滑点 0.1%
@@ -203,7 +203,7 @@ FOREX = ForexConfig()
 # ==================== 风控配置 ====================
 @dataclass
 class RiskConfig:
-    max_daily_trades: int = 50      # 每日最大交易次数
+    max_daily_trades: int = 0      # 每日最大交易次数 (0=不限制)
     max_daily_loss: float = 5000    # 每日最大亏损 (RMB)
     leg_timeout_sec: float = 2.0    # 第二腿超时时间 (秒)
     leg_retry_times: int = 2        # 第二腿重试次数

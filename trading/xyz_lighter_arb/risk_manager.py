@@ -96,7 +96,7 @@ class RiskManager:
             return False, f"Cooldown period, {remaining:.0f}s remaining"
 
         # 每日交易次数限制
-        if self._daily_stats.trade_count >= self.max_daily_trades:
+        if self.max_daily_trades > 0 and self._daily_stats.trade_count >= self.max_daily_trades:
             return False, f"Daily trade limit reached: {self.max_daily_trades}"
 
         # 每日亏损限制
