@@ -149,6 +149,10 @@ class SilverHedgeBot:
         self._last_remote_ok_ts = ""
         self._last_remote_err = ""
         self._margin_risk_last_notified = {"CTP": 0.0, "HL": 0.0}
+        self._alert_last_notified: dict[str, float] = {}
+        self._ctp_reconnect_lock = asyncio.Lock()
+        self._ctp_connected_at: float = 0.0
+        self._ctp_paused_by_session = False
 
     async def initialize(self):
         """Initialize exchanges and data sources."""
@@ -157,8 +161,16 @@ class SilverHedgeBot:
         self._ensure_trade_log_file()
         self._log_runtime_config()
 
-        logger.info("正在连接 CTP 网关...")
-        await self._connect_ctp_with_fallback()
+        current_session = self.session_mgr.get_session_type()
+        should_connect_ctp = not (
+            RISK.disconnect_ctp_when_closed and current_session == SessionType.CLOSED
+        )
+        if should_connect_ctp:
+            logger.info("正在连接 CTP 网关...")
+            await self._connect_ctp_with_fallback()
+        else:
+            logger.info("当前为非交易时段，暂不连接 CTP，等待开盘后自动连接")
+            self._ctp_paused_by_session = True
 
         if RUNTIME.dry_run:
             logger.info("当前模式: DRY_RUN=true（只跑信号与风控，不发真实下单）")
@@ -205,7 +217,7 @@ class SilverHedgeBot:
         self.data_engine.on_price(self._on_price)
 
         # 鍚姩鏁版嵁寮曟搸
-        await self.data_engine.start()
+        await self.data_engine.start(include_ctp=should_connect_ctp)
 
         # 鍙戦€佸惎鍔ㄩ€氱煡
         await self.notifier.notify_startup(
@@ -248,6 +260,8 @@ class SilverHedgeBot:
             )
             try:
                 await self.ctp_gateway.connect()
+                self._ctp_connected_at = time.time()
+                self._ctp_paused_by_session = False
                 logger.info(f"CTP 已连接, 使用前置: MD={md_front}, TD={td_front}")
                 return
             except Exception as e:
@@ -261,6 +275,54 @@ class SilverHedgeBot:
                     pass
 
         raise ConnectionError(f"所有 CTP 前置连接失败, last_error={last_error}")
+
+    def _should_send_alert(self, key: str, cooldown_sec: int) -> bool:
+        now = time.time()
+        last = self._alert_last_notified.get(key, 0.0)
+        if now - last >= cooldown_sec:
+            self._alert_last_notified[key] = now
+            return True
+        return False
+
+    async def _ensure_ctp_online_for_session(self):
+        if self.ctp_gateway.is_connected:
+            return
+        async with self._ctp_reconnect_lock:
+            if self.ctp_gateway.is_connected:
+                return
+            logger.info("交易时段开始，自动连接 CTP")
+            await self._connect_ctp_with_fallback()
+            self.data_engine.activate_ctp_stream()
+
+    async def _pause_ctp_for_closed_session(self):
+        if not RISK.disconnect_ctp_when_closed:
+            return
+        if not self.ctp_gateway.is_connected:
+            self._ctp_paused_by_session = True
+            self._ctp_connected_at = 0.0
+            self.data_engine.deactivate_ctp_stream()
+            return
+        async with self._ctp_reconnect_lock:
+            if not self.ctp_gateway.is_connected:
+                self._ctp_paused_by_session = True
+                self._ctp_connected_at = 0.0
+                self.data_engine.deactivate_ctp_stream()
+                return
+            logger.info("非交易时段，自动断开 CTP")
+            self.data_engine.deactivate_ctp_stream()
+            await self.ctp_gateway.close()
+            self._ctp_paused_by_session = True
+            self._ctp_connected_at = 0.0
+
+    async def _reconnect_ctp_stream(self, reason: str):
+        async with self._ctp_reconnect_lock:
+            logger.warning(f"触发 CTP 重连: reason={reason}")
+            try:
+                await self.ctp_gateway.close()
+            except Exception as e:
+                logger.warning(f"CTP 关闭异常(忽略): {e}")
+            await self._connect_ctp_with_fallback()
+            self.data_engine.activate_ctp_stream()
 
     async def _on_price(self, price: NormalizedPrice):
         """DataEngine callback: price -> signal -> execution."""
@@ -559,6 +621,7 @@ class SilverHedgeBot:
             asyncio.create_task(self._funding_rate_loop()),
             asyncio.create_task(self._margin_monitor_loop()),
             asyncio.create_task(self._health_monitor_loop()),
+            asyncio.create_task(self._md_watchdog_loop()),
             asyncio.create_task(self._session_transition_loop()),
             asyncio.create_task(self._status_heartbeat_loop()),
             asyncio.create_task(self._market_snapshot_loop()),
@@ -730,9 +793,11 @@ class SilverHedgeBot:
         """Run periodic health checks and alerts."""
         while self._running:
             issues = []
+            current_session = self.session_mgr.get_session_type()
+            in_session = current_session != SessionType.CLOSED
 
             # CTP 连接
-            if not self.ctp_gateway.is_connected:
+            if in_session and not self.ctp_gateway.is_connected:
                 issues.append("CTP 网关断开")
 
             # HL/AG 数据新鲜度
@@ -741,7 +806,7 @@ class SilverHedgeBot:
                 if latest.hl_stale:
                     hl_age = self.data_engine.hl_last_update_age
                     issues.append(f"HL 价格过期 ({hl_age:.0f}s)")
-                if latest.ag_stale:
+                if in_session and latest.ag_stale:
                     issues.append("AG 行情过期")
 
             # 汇率
@@ -759,10 +824,44 @@ class SilverHedgeBot:
             if issues:
                 msg = "健康检查异常:\n" + "\n".join(f"- {i}" for i in issues)
                 logger.warning(msg)
-                if any(kw in msg for kw in ("disconnect", "emergency")):
+                if any(kw in msg for kw in ("断开", "紧急")):
                     await self.notifier.notify_emergency(msg)
 
             await asyncio.sleep(60)
+
+    async def _md_watchdog_loop(self):
+        """During trading sessions, reconnect CTP if AG ticks stop updating for too long."""
+        while self._running:
+            try:
+                session_type = self.session_mgr.get_session_type()
+                if session_type == SessionType.CLOSED:
+                    await asyncio.sleep(5)
+                    continue
+
+                if not self.ctp_gateway.is_connected:
+                    await asyncio.sleep(5)
+                    continue
+
+                threshold = max(5, int(RISK.md_watchdog_no_tick_sec))
+                age = self.data_engine.ag_last_tick_age
+                if age < 0 and self._ctp_connected_at > 0:
+                    age = time.time() - self._ctp_connected_at
+
+                if age >= threshold:
+                    detail = (
+                        f"MD watchdog触发: AG连续{age:.0f}s无新tick(阈值{threshold}s), "
+                        f"session={session_type.value}, 自动重连CTP"
+                    )
+                    logger.warning(detail)
+                    if self._should_send_alert(
+                        "md_watchdog",
+                        max(60, int(RISK.md_watchdog_alert_cooldown_sec)),
+                    ):
+                        await self.notifier.notify_error(detail, "SILVER")
+                    await self._reconnect_ctp_stream("md_watchdog_no_tick")
+            except Exception as e:
+                logger.warning(f"MD watchdog异常: {e}")
+            await asyncio.sleep(5)
 
     async def _session_transition_loop(self):
         """Detect trading-session transitions and send Feishu notifications."""
@@ -777,8 +876,10 @@ class SilverHedgeBot:
                     continue
 
                 if previous == SessionType.CLOSED and current != SessionType.CLOSED:
+                    await self._ensure_ctp_online_for_session()
                     await self._notify_session_transition("START", current)
                 elif previous != SessionType.CLOSED and current == SessionType.CLOSED:
+                    await self._pause_ctp_for_closed_session()
                     await self._notify_session_transition("END", previous)
             except Exception as e:
                 logger.warning(f"交易时段切换通知异常: {e}")

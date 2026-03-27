@@ -73,6 +73,7 @@ class DataEngine:
 
         # 状态
         self._running = False
+        self._ctp_stream_active = False
 
     @property
     def latest(self) -> Optional[NormalizedPrice]:
@@ -85,20 +86,26 @@ class DataEngine:
             return -1
         return time.time() - self._hl_update_time
 
+    @property
+    def ag_last_tick_age(self) -> float:
+        """AG tick 数据年龄 (秒), 未收到过数据时返回 -1"""
+        if self._ag_tick is None:
+            return -1
+        return time.time() - self._ag_tick.timestamp
+
     def on_price(self, callback: Callable[[NormalizedPrice], Any]):
         """注册价格更新回调"""
         self._callbacks.append(callback)
 
-    async def start(self):
+    async def start(self, include_ctp: bool = True):
         """启动数据源"""
         self._running = True
 
         # 1. CTP: 订阅行情, 注册 tick 回调
-        instrument = self._pair.ctp_instrument
-        logger.info(f"DataEngine CTP instrument={instrument!r} type={type(instrument).__name__}")
-        self._ctp.subscribe(instrument)
-        self._ctp.on_tick(instrument, self._on_ag_tick)
-        logger.info(f"已订阅 CTP 行情: {instrument}")
+        if include_ctp:
+            self.activate_ctp_stream()
+        else:
+            logger.info("当前未启用 CTP 行情订阅（等待交易时段）")
 
         # 2. HL: 启动 WebSocket 获取实时价格
         asyncio.create_task(self._run_hl_ws())
@@ -107,6 +114,20 @@ class DataEngine:
         asyncio.create_task(self._forex.start())
 
         logger.info("DataEngine 启动完成")
+
+    def activate_ctp_stream(self):
+        """确保 CTP 订阅与回调已激活（用于首次启动或重连后重订阅）"""
+        instrument = self._pair.ctp_instrument
+        logger.info(f"DataEngine CTP instrument={instrument!r} type={type(instrument).__name__}")
+        self._ctp.subscribe(instrument)
+        self._ctp.on_tick(instrument, self._on_ag_tick)
+        self._ctp_stream_active = True
+        logger.info(f"已订阅 CTP 行情: {instrument}")
+
+    def deactivate_ctp_stream(self):
+        """停用 CTP 数据流（不关闭 HL / Forex）"""
+        self._ctp_stream_active = False
+        self._ag_tick = None
 
     async def _on_ag_tick(self, tick: TickData):
         """CTP tick 回调 (由 CTP 线程通过 call_soon_threadsafe 调度)"""
