@@ -3,6 +3,10 @@
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -79,6 +83,8 @@ class APIConfig:
     # HL signer key: 推荐使用 API wallet(代理钱包)私钥，而不是主钱包私钥
     hl_api_wallet_private_key: str = ""
     hl_wallet_address: str = ""
+    hl_api_wallet_secret_id: str = ""      # Optional: AWS Secrets Manager secret id/name
+    aws_region: str = ""                   # Optional: AWS region for secrets fetch
 
     # CTP (国贸期货)
     ctp_broker_id: str = "0187"
@@ -129,12 +135,60 @@ def load_runtime_config():
             pass
 
 
-def load_api_keys():
-    """从环境变量加载敏感信息"""
+def _load_hl_key_from_aws_secret(secret_id: str, region: str) -> str:
+    """Fetch HL private key from AWS Secrets Manager and normalize it."""
+    try:
+        import boto3  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "AWS secret is configured but boto3 is not installed. "
+            "Install with `pip install boto3`."
+        ) from e
+
+    kwargs = {}
+    if region:
+        kwargs["region_name"] = region
+
+    client = boto3.client("secretsmanager", **kwargs)
+    resp = client.get_secret_value(SecretId=secret_id)
+    secret = (resp.get("SecretString") or "").strip()
+    if not secret:
+        raise RuntimeError("SecretString is empty")
+
+    # Supports plain key or JSON payload.
+    if secret.startswith("{") and secret.endswith("}"):
+        import json
+
+        obj = json.loads(secret)
+        for k in ("HL_API_WALLET_PRIVATE_KEY", "private_key", "key", "secret"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        raise RuntimeError("JSON secret does not contain a supported private key field")
+    return secret
+
+
+def load_api_keys(dry_run: bool = False, hl_exec_mode: str = "local"):
+    """从环境变量（或 AWS Secrets Manager）加载敏感信息"""
     # Hyperliquid
     API.hl_dex = os.environ.get('HL_DEX', API.hl_dex)
     API.hl_api_wallet_private_key = os.environ.get('HL_API_WALLET_PRIVATE_KEY', '').strip()
-    API.hl_wallet_address = os.environ.get('HL_WALLET_ADDRESS', '')
+    API.hl_wallet_address = os.environ.get('HL_WALLET_ADDRESS', '').strip()
+    API.hl_api_wallet_secret_id = os.environ.get('HL_API_WALLET_SECRET_ID', '').strip()
+    API.aws_region = (
+        os.environ.get('AWS_REGION', '').strip()
+        or os.environ.get('AWS_DEFAULT_REGION', '').strip()
+    )
+
+    # Only resolve secret when key is needed.
+    needs_hl_key = (not dry_run) and (hl_exec_mode != "remote")
+    if needs_hl_key and (not API.hl_api_wallet_private_key) and API.hl_api_wallet_secret_id:
+        API.hl_api_wallet_private_key = _load_hl_key_from_aws_secret(
+            API.hl_api_wallet_secret_id,
+            API.aws_region,
+        )
+        logger.info("Loaded HL API wallet private key from AWS Secrets Manager")
+
     # CTP
     API.ctp_user_id = os.environ.get('CTP_USER_ID', '')
     API.ctp_password = os.environ.get('CTP_PASSWORD', '')
@@ -170,7 +224,7 @@ def get_ctp_front_candidates() -> List[Tuple[str, str]]:
     return candidates
 
 
-def validate_api_keys(dry_run: bool = False):
+def validate_api_keys(dry_run: bool = False, hl_exec_mode: str = "local"):
     """校验 API 密钥是否已配置, 缺失则抛出异常"""
     missing = []
     if not API.ctp_user_id:
@@ -179,7 +233,8 @@ def validate_api_keys(dry_run: bool = False):
         missing.append('CTP_PASSWORD')
     if not API.ctp_auth_code:
         missing.append('CTP_AUTH_CODE')
-    if not dry_run:
+    needs_hl_key = (not dry_run) and (hl_exec_mode != "remote")
+    if needs_hl_key:
         if not API.hl_api_wallet_private_key:
             missing.append('HL_API_WALLET_PRIVATE_KEY')
         if not API.hl_wallet_address:

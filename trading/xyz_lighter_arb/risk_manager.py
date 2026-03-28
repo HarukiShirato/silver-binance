@@ -82,16 +82,18 @@ class RiskManager:
             self._today = today
             self._daily_stats = DailyStats(date=today)
 
-    def can_trade(self, pair_name: str) -> tuple[bool, str]:
+    def can_trade(self, pair_name: str, signal: str = "") -> tuple[bool, str]:
         """检查是否可以交易"""
         self._check_new_day()
+        signal = (signal or "").strip().upper()
 
         # 紧急停止
         if self._emergency_stop:
             return False, "Emergency stop activated"
 
-        # 冷却期
-        if time.time() < self._cooldown_until:
+        # 冷却期仅限制开仓，平仓信号不受冷却限制。
+        is_entry_signal = signal in ("LONG", "SHORT") or signal == ""
+        if is_entry_signal and time.time() < self._cooldown_until:
             remaining = self._cooldown_until - time.time()
             return False, f"Cooldown period, {remaining:.0f}s remaining"
 

@@ -47,8 +47,8 @@ class SilverHedgeBot:
 
     def __init__(self):
         load_runtime_config()
-        load_api_keys()
-        validate_api_keys(dry_run=RUNTIME.dry_run)
+        load_api_keys(dry_run=RUNTIME.dry_run, hl_exec_mode=RUNTIME.hl_exec_mode)
+        validate_api_keys(dry_run=RUNTIME.dry_run, hl_exec_mode=RUNTIME.hl_exec_mode)
         load_notify_config()
 
         pair = TRADING_PAIRS['SILVER']
@@ -374,7 +374,7 @@ class SilverHedgeBot:
         )
 
         # 椋庢帶妫€鏌?
-        can_trade, reason = self.risk_manager.can_trade('SILVER')
+        can_trade, reason = self.risk_manager.can_trade('SILVER', signal=signal.signal.value)
         if not can_trade:
             logger.warning(f"交易被阻止: {reason}")
             self._decision_stats[f"blocked_risk_{reason}"] += 1
