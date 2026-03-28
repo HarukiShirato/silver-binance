@@ -10,8 +10,8 @@ OUNCE_TO_KG = 0.0311035          # 1 金衡盎司 = 0.0311035 kg
 AG_LOT_KG = 15                   # SHFE 白银: 1手 = 15 kg
 HL_LOT_OZ = AG_LOT_KG / OUNCE_TO_KG  # ~482.25 oz (1手AG对应的HL盎司数)
 AG_TICK_SIZE = 1                  # AG 最小变动价位: 1 RMB/kg
-AG_FEE_RATE = 0.00005            # 万分之0.5 per side
-HL_FEE_RATE = 0.00035            # 0.035% taker per side
+AG_FEE_PER_LOT = 0.01            # 1手(1张)手续费 0.01 RMB per side
+HL_FEE_RATE = 0.000405           # 0.0405% taker per side
 SLIPPAGE_RATE = 0.0001           # 0.01% per side per leg
 DEFAULT_USDCNY = 7.25            # 默认汇率 (fallback)
 
@@ -51,7 +51,7 @@ def ag_lots_to_kg(lots: int) -> float:
 
 def calculate_ag_fee(price_cny_kg: float, lots: int) -> float:
     """AG 单边手续费 (RMB) = price * 15kg * lots * 0.00005"""
-    return price_cny_kg * AG_LOT_KG * lots * AG_FEE_RATE
+    return max(lots, 0) * AG_FEE_PER_LOT
 
 
 def calculate_hl_fee(price_usd_oz: float, size_oz: float) -> float:
@@ -71,7 +71,7 @@ def calculate_round_trip_fee(
     hl_size_oz = ag_lots_to_hl_oz(lots)
 
     # AG 往返手续费 (RMB)
-    ag_fee = (ag_entry_price + ag_exit_price) * AG_LOT_KG * lots * AG_FEE_RATE
+    ag_fee = max(lots, 0) * AG_FEE_PER_LOT * 2
 
     # HL 往返手续费 (USD → RMB)
     hl_fee_usd = (hl_entry_price + hl_exit_price) * hl_size_oz * HL_FEE_RATE

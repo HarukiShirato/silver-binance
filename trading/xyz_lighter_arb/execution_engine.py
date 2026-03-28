@@ -16,7 +16,6 @@ from exchanges.hyperliquid import HyperliquidClient
 from signal_engine import Signal, SignalResult
 from unit_converter import (
     ag_lots_to_hl_oz, calculate_ag_fee, calculate_hl_fee,
-    AG_LOT_KG, HL_FEE_RATE, AG_FEE_RATE,
 )
 from config import TradingPair, STRATEGY
 from notifier import FeishuNotifier

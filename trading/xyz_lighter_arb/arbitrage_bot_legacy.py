@@ -58,7 +58,7 @@ class ArbitrageBot:
 
         # 飞书通知
         self.notifier = FeishuNotifier(
-            webhook_url=NOTIFY.feishu_webhook_url,
+            webhook_url=NOTIFY.feishu_trade_webhook_url,
             enabled=NOTIFY.enable_feishu,
         )
 
@@ -80,7 +80,7 @@ class ArbitrageBot:
         self.xyz_client = HyperliquidClient(
             api_url=API.hl_api_url,
             ws_url=API.hl_ws_url,
-            private_key=API.hl_private_key,
+            private_key=API.hl_api_wallet_private_key,
             wallet_address=API.hl_wallet_address,
         )
 

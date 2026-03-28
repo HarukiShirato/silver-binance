@@ -476,15 +476,35 @@ class CTPGateway:
         """订阅行情"""
         if not self._md_api:
             raise RuntimeError("行情 API 未连接")
+        # Defensive normalization: CTP Python binding requires List[str]
+        if isinstance(instrument_id, (list, tuple)):
+            if len(instrument_id) != 1:
+                raise TypeError(f"instrument_id list/tuple length must be 1, got {len(instrument_id)}")
+            instrument_id = instrument_id[0]
+        if not isinstance(instrument_id, str):
+            instrument_id = str(instrument_id)
+        instrument_id = instrument_id.strip()
+        if not instrument_id:
+            raise ValueError("instrument_id is empty after normalization")
+
         self._tick_history[instrument_id] = deque(maxlen=history_size)
-        ret = self._md_api.SubscribeMarketData([instrument_id], 1)
+        logger.info(f"CTP subscribe instrument={instrument_id!r} type={type(instrument_id).__name__}")
+        try:
+            ret = self._md_api.SubscribeMarketData([instrument_id], 1)
+        except TypeError as e:
+            # Some CTP Python bindings on Py3 require bytes-like strings.
+            logger.warning(f"SubscribeMarketData str call failed, fallback to bytes: {e}")
+            ret = self._md_api.SubscribeMarketData([instrument_id.encode("utf-8")], 1)
         if ret != 0:
             logger.error(f"订阅 {instrument_id} 失败, ret={ret}")
 
     def unsubscribe(self, instrument_id: str):
         """取消订阅"""
         if self._md_api:
-            self._md_api.UnSubscribeMarketData([instrument_id], 1)
+            try:
+                self._md_api.UnSubscribeMarketData([instrument_id], 1)
+            except TypeError:
+                self._md_api.UnSubscribeMarketData([instrument_id.encode("utf-8")], 1)
         self._tick_history.pop(instrument_id, None)
         self._tick_callbacks.pop(instrument_id, None)
 

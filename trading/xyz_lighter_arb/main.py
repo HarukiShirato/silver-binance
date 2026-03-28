@@ -7,10 +7,13 @@ import asyncio
 import signal
 import os
 import csv
+import uuid
+import time
 from collections import Counter
 from datetime import datetime
 
 import logging
+from logging.handlers import RotatingFileHandler
 # 纭繚鏃ュ織鐩綍鍦?FileHandler 鍒濆鍖栧墠瀛樺湪
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -18,7 +21,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("logs/hedge.log"),
+        RotatingFileHandler("logs/hedge.log", maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"),
     ]
 )
 logger = logging.getLogger("SilverHedge")
@@ -33,6 +36,7 @@ from session_manager import SessionManager, SessionType
 from data_engine import DataEngine, NormalizedPrice
 from signal_engine import SignalEngine, Signal, SignalResult
 from execution_engine import ExecutionEngine
+from remote_hl_executor import RemoteHLExecutorClient
 from risk_manager import RiskManager
 from position_manager import PositionManager, MarginLevel
 from notifier import FeishuNotifier
@@ -43,8 +47,8 @@ class SilverHedgeBot:
 
     def __init__(self):
         load_runtime_config()
-        load_api_keys()
-        validate_api_keys(dry_run=RUNTIME.dry_run)
+        load_api_keys(dry_run=RUNTIME.dry_run, hl_exec_mode=RUNTIME.hl_exec_mode)
+        validate_api_keys(dry_run=RUNTIME.dry_run, hl_exec_mode=RUNTIME.hl_exec_mode)
         load_notify_config()
 
         pair = TRADING_PAIRS['SILVER']
@@ -62,7 +66,8 @@ class SilverHedgeBot:
         self.hl_client = HyperliquidClient(
             api_url=API.hl_api_url,
             ws_url=API.hl_ws_url,
-            private_key=API.hl_private_key,
+            dex=API.hl_dex,
+            private_key=API.hl_api_wallet_private_key,
             wallet_address=API.hl_wallet_address,
         )
 
@@ -112,7 +117,11 @@ class SilverHedgeBot:
 
         # 閫氱煡
         self.notifier = FeishuNotifier(
-            webhook_url=NOTIFY.feishu_webhook_url,
+            webhook_url=NOTIFY.feishu_trade_webhook_url,
+            enabled=NOTIFY.enable_feishu,
+        )
+        self.margin_notifier = FeishuNotifier(
+            webhook_url=NOTIFY.feishu_margin_webhook_url or NOTIFY.feishu_trade_webhook_url,
             enabled=NOTIFY.enable_feishu,
         )
 
@@ -124,6 +133,12 @@ class SilverHedgeBot:
             notifier=self.notifier,
             leg_timeout_sec=RISK.leg_timeout_sec,
         )
+        self.remote_hl_executor = None
+        if RUNTIME.hl_exec_mode == "remote" and RUNTIME.hl_remote_url:
+            self.remote_hl_executor = RemoteHLExecutorClient(
+                base_url=RUNTIME.hl_remote_url,
+                timeout_sec=RUNTIME.remote_exec_timeout_sec,
+            )
 
         self._running = False
         self._total_fees_today = 0.0
@@ -131,21 +146,56 @@ class SilverHedgeBot:
         self._decision_stats = Counter()
         self._trade_log_file = os.path.join("data", "trade_events.csv")
         self._window_full_notified = False
+        self._last_remote_ok_ts = ""
+        self._last_remote_err = ""
+        self._margin_risk_last_notified = {"CTP": 0.0, "HL": 0.0}
+        self._alert_last_notified: dict[str, float] = {}
+        self._ctp_reconnect_lock = asyncio.Lock()
+        self._ctp_connected_at: float = 0.0
+        self._ctp_paused_by_session = False
 
     async def initialize(self):
         """Initialize exchanges and data sources."""
         os.makedirs("logs", exist_ok=True)
         os.makedirs("data", exist_ok=True)
         self._ensure_trade_log_file()
+        self._log_runtime_config()
 
-        logger.info("正在连接 CTP 网关...")
-        await self._connect_ctp_with_fallback()
+        current_session = self.session_mgr.get_session_type()
+        should_connect_ctp = not (
+            RISK.disconnect_ctp_when_closed and current_session == SessionType.CLOSED
+        )
+        if should_connect_ctp:
+            logger.info("正在连接 CTP 网关...")
+            await self._connect_ctp_with_fallback()
+        else:
+            logger.info("当前为非交易时段，暂不连接 CTP，等待开盘后自动连接")
+            self._ctp_paused_by_session = True
 
         if RUNTIME.dry_run:
             logger.info("当前模式: DRY_RUN=true（只跑信号与风控，不发真实下单）")
 
         logger.info("正在缓存 HL asset_id...")
         await self.hl_client._ensure_asset_ids()
+
+        if self.remote_hl_executor is not None:
+            health = self.remote_hl_executor.health_check()
+            if health.ok:
+                logger.info(
+                    f"远程HL网关探活成功: code={health.status_code} latency={health.latency_ms:.1f}ms"
+                )
+            else:
+                logger.warning(
+                    f"远程HL网关探活失败: code={health.status_code} latency={health.latency_ms:.1f}ms detail={health.detail}"
+                )
+
+        restored = self.signal_engine.load_window_state(load_points=20)
+        if restored > 0:
+            logger.info(
+                f"已恢复信号窗口样本: {restored}/{self.signal_engine.window_size} (warm start)"
+            )
+            if self.signal_engine.sample_count >= self.signal_engine.window_size:
+                self._window_full_notified = True
 
         # 鍔犺浇椋庢帶鐘舵€?
         self.risk_manager.load_state()
@@ -167,7 +217,7 @@ class SilverHedgeBot:
         self.data_engine.on_price(self._on_price)
 
         # 鍚姩鏁版嵁寮曟搸
-        await self.data_engine.start()
+        await self.data_engine.start(include_ctp=should_connect_ctp)
 
         # 鍙戦€佸惎鍔ㄩ€氱煡
         await self.notifier.notify_startup(
@@ -180,6 +230,19 @@ class SilverHedgeBot:
             await self._notify_session_transition("START", self._last_session_type)
 
         logger.info("SilverHedgeBot initialized")
+
+    def _log_runtime_config(self):
+        pair = TRADING_PAIRS['SILVER']
+        logger.info(
+            "运行配置摘要: "
+            f"mode={'DRY_RUN' if RUNTIME.dry_run else 'LIVE'} "
+            f"hl_exec_mode={RUNTIME.hl_exec_mode} "
+            f"hl_remote_url={RUNTIME.hl_remote_url or 'N/A'} "
+            f"entry_z={STRATEGY.entry_zscore} exit_z={STRATEGY.exit_zscore} stop_z={STRATEGY.stop_loss_zscore} "
+            f"window={STRATEGY.spread_window} sample_interval={STRATEGY.sample_interval}s "
+            f"max_lots={STRATEGY.max_position_lots} emergency_spread_pct={RISK.emergency_spread_pct} "
+            f"ctp_instrument={pair.ctp_instrument} hl_symbol={pair.hl_symbol}"
+        )
 
     async def _connect_ctp_with_fallback(self):
         fronts = get_ctp_front_candidates()
@@ -197,6 +260,8 @@ class SilverHedgeBot:
             )
             try:
                 await self.ctp_gateway.connect()
+                self._ctp_connected_at = time.time()
+                self._ctp_paused_by_session = False
                 logger.info(f"CTP 已连接, 使用前置: MD={md_front}, TD={td_front}")
                 return
             except Exception as e:
@@ -210,6 +275,54 @@ class SilverHedgeBot:
                     pass
 
         raise ConnectionError(f"所有 CTP 前置连接失败, last_error={last_error}")
+
+    def _should_send_alert(self, key: str, cooldown_sec: int) -> bool:
+        now = time.time()
+        last = self._alert_last_notified.get(key, 0.0)
+        if now - last >= cooldown_sec:
+            self._alert_last_notified[key] = now
+            return True
+        return False
+
+    async def _ensure_ctp_online_for_session(self):
+        if self.ctp_gateway.is_connected:
+            return
+        async with self._ctp_reconnect_lock:
+            if self.ctp_gateway.is_connected:
+                return
+            logger.info("交易时段开始，自动连接 CTP")
+            await self._connect_ctp_with_fallback()
+            self.data_engine.activate_ctp_stream()
+
+    async def _pause_ctp_for_closed_session(self):
+        if not RISK.disconnect_ctp_when_closed:
+            return
+        if not self.ctp_gateway.is_connected:
+            self._ctp_paused_by_session = True
+            self._ctp_connected_at = 0.0
+            self.data_engine.deactivate_ctp_stream()
+            return
+        async with self._ctp_reconnect_lock:
+            if not self.ctp_gateway.is_connected:
+                self._ctp_paused_by_session = True
+                self._ctp_connected_at = 0.0
+                self.data_engine.deactivate_ctp_stream()
+                return
+            logger.info("非交易时段，自动断开 CTP")
+            self.data_engine.deactivate_ctp_stream()
+            await self.ctp_gateway.close()
+            self._ctp_paused_by_session = True
+            self._ctp_connected_at = 0.0
+
+    async def _reconnect_ctp_stream(self, reason: str):
+        async with self._ctp_reconnect_lock:
+            logger.warning(f"触发 CTP 重连: reason={reason}")
+            try:
+                await self.ctp_gateway.close()
+            except Exception as e:
+                logger.warning(f"CTP 关闭异常(忽略): {e}")
+            await self._connect_ctp_with_fallback()
+            self.data_engine.activate_ctp_stream()
 
     async def _on_price(self, price: NormalizedPrice):
         """DataEngine callback: price -> signal -> execution."""
@@ -253,17 +366,27 @@ class SilverHedgeBot:
 
     async def _process_signal(self, signal: SignalResult):
         """Handle a trading signal."""
+        signal_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{signal.signal.value}-{uuid.uuid4().hex[:8]}"
         logger.info(
-            f"信号: {signal.signal.value} | "
+            f"信号[{signal_id}]: {signal.signal.value} | "
             f"AG={signal.ag_price:.1f} CNY/kg HL=${signal.hl_price_usd_oz:.4f} | "
             f"spread={signal.spread_pct:.3f}% zscore={signal.zscore:.2f}"
         )
 
         # 椋庢帶妫€鏌?
-        can_trade, reason = self.risk_manager.can_trade('SILVER')
+        can_trade, reason = self.risk_manager.can_trade('SILVER', signal=signal.signal.value)
         if not can_trade:
             logger.warning(f"交易被阻止: {reason}")
             self._decision_stats[f"blocked_risk_{reason}"] += 1
+            self._append_trade_event(
+                signal=signal.signal.value,
+                lots=0,
+                status="blocked",
+                fee_rmb=0.0,
+                reason=f"risk:{reason}",
+                signal_data=signal,
+                signal_id=signal_id,
+            )
             return
 
         # 浠峰樊瀹夊叏妫€鏌?
@@ -273,6 +396,15 @@ class SilverHedgeBot:
         if not safe:
             await self.notifier.notify_emergency(reason)
             self._decision_stats[f"blocked_spread_{reason}"] += 1
+            self._append_trade_event(
+                signal=signal.signal.value,
+                lots=0,
+                status="blocked",
+                fee_rmb=0.0,
+                reason=f"spread:{reason}",
+                signal_data=signal,
+                signal_id=signal_id,
+            )
             return
 
         # 璁＄畻鎵嬫暟
@@ -290,6 +422,15 @@ class SilverHedgeBot:
         if lots <= 0:
             logger.warning("计算手数为 0，跳过")
             self._decision_stats["blocked_lots_zero"] += 1
+            self._append_trade_event(
+                signal=signal.signal.value,
+                lots=0,
+                status="blocked",
+                fee_rmb=0.0,
+                reason="lots_zero",
+                signal_data=signal,
+                signal_id=signal_id,
+            )
             return
 
         # 璁板綍浜ゆ槗寮€濮?
@@ -321,6 +462,33 @@ class SilverHedgeBot:
             else:
                 self.position_manager.on_close(lots)
                 self.signal_engine.reset_funding()
+
+            if self.remote_hl_executor is not None:
+                remote_payload = {
+                    "signal_id": signal_id,
+                    "signal": signal.signal.value,
+                    "symbol": TRADING_PAIRS['SILVER'].hl_symbol,
+                    "lots": lots,
+                    "hl_size_oz": lots * TRADING_PAIRS['SILVER'].ctp_multiplier / 0.0311035,
+                    "ag_price": signal.ag_price,
+                    "hl_price_usd": signal.hl_price_usd_oz,
+                    "usdcny": signal.usdcny,
+                    "spread_pct": signal.spread_pct,
+                    "zscore": signal.zscore,
+                    "ts": signal.timestamp,
+                }
+                remote_result = self.remote_hl_executor.send_dry_run(remote_payload)
+                if remote_result.ok:
+                    self._last_remote_ok_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self._last_remote_err = ""
+                    logger.info(
+                        f"远程HL执行回执 OK: signal_id={signal_id} code={remote_result.status_code} latency={remote_result.latency_ms:.1f}ms"
+                    )
+                else:
+                    self._last_remote_err = f"code={remote_result.status_code} detail={remote_result.detail}"
+                    logger.warning(
+                        f"远程HL执行回执失败: signal_id={signal_id} code={remote_result.status_code} latency={remote_result.latency_ms:.1f}ms detail={remote_result.detail}"
+                    )
 
             self.risk_manager.save_position_state(
                 pair_name='SILVER',
@@ -357,6 +525,7 @@ class SilverHedgeBot:
                 fee_rmb=0.0,
                 reason="dry_run_fill",
                 signal_data=signal,
+                signal_id=signal_id,
             )
             logger.info(
                 "DRY_RUN 成交模拟: "
@@ -395,6 +564,7 @@ class SilverHedgeBot:
                     fee_rmb=result.total_fee_rmb,
                     reason="live_fill",
                     signal_data=signal,
+                    signal_id=signal_id,
                 )
 
                 if NOTIFY.notify_on_trade:
@@ -417,6 +587,7 @@ class SilverHedgeBot:
                     fee_rmb=0.0,
                     reason=result.error or "live_execute_not_filled",
                     signal_data=signal,
+                    signal_id=signal_id,
                 )
                 if NOTIFY.notify_on_error:
                     await self.notifier.notify_error(result.error, 'SILVER')
@@ -435,6 +606,7 @@ class SilverHedgeBot:
                 fee_rmb=0.0,
                 reason=str(e),
                 signal_data=signal,
+                signal_id=signal_id,
             )
             if NOTIFY.notify_on_error:
                 await self.notifier.notify_error(str(e), 'SILVER')
@@ -449,8 +621,10 @@ class SilverHedgeBot:
             asyncio.create_task(self._funding_rate_loop()),
             asyncio.create_task(self._margin_monitor_loop()),
             asyncio.create_task(self._health_monitor_loop()),
+            asyncio.create_task(self._md_watchdog_loop()),
             asyncio.create_task(self._session_transition_loop()),
             asyncio.create_task(self._status_heartbeat_loop()),
+            asyncio.create_task(self._market_snapshot_loop()),
         ]
 
         try:
@@ -462,7 +636,7 @@ class SilverHedgeBot:
         """Fetch funding rate periodically."""
         while self._running:
             try:
-                rate = await self.hl_client.get_funding_rate("SILVER")
+                rate = await self.hl_client.get_funding_rate(TRADING_PAIRS['SILVER'].hl_symbol)
                 self.signal_engine.update_funding_rate(rate)
                 logger.info(f"HL SILVER funding rate: {rate:.6f}")
             except Exception as e:
@@ -478,11 +652,10 @@ class SilverHedgeBot:
             except Exception as e:
                 logger.warning(f"CTP 保证金查询失败: {e}")
 
-            if not RUNTIME.dry_run:
-                try:
-                    await self._check_hl_margin()
-                except Exception as e:
-                    logger.warning(f"HL 保证金查询失败: {e}")
+            try:
+                await self._check_hl_margin()
+            except Exception as e:
+                logger.warning(f"HL 保证金查询失败: {e}")
 
             await asyncio.sleep(interval)
 
@@ -503,9 +676,13 @@ class SilverHedgeBot:
             unrealized_pnl=acct.profit,
         )
 
-        # 绛夌骇鍗囬珮(鎭跺寲)鏃跺彂椋炰功閫氱煡
-        if new_level != old_level and new_level != MarginLevel.NORMAL:
-            await self.notifier.notify_margin_warning(
+        # 等级变化时通知一次；DANGER/CRITICAL 持续状态每60秒重复告警
+        should_notify = (
+            (new_level != old_level and new_level != MarginLevel.NORMAL)
+            or self._should_repeat_margin_alert("CTP", new_level)
+        )
+        if should_notify:
+            await self.margin_notifier.notify_margin_warning(
                 account_name="CTP",
                 level=new_level,
                 margin_ratio=self.position_manager.ctp_margin.margin_ratio,
@@ -516,6 +693,8 @@ class SilverHedgeBot:
 
     async def _check_hl_margin(self):
         """Query HL account and update margin state."""
+        if not API.hl_wallet_address:
+            return
         state = await self.hl_client.get_user_state()
         if not state:
             return
@@ -540,9 +719,13 @@ class SilverHedgeBot:
             unrealized_pnl=unrealized_pnl,
         )
 
-        # 绛夌骇鍗囬珮(鎭跺寲)鏃跺彂椋炰功閫氱煡
-        if new_level != old_level and new_level != MarginLevel.NORMAL:
-            await self.notifier.notify_margin_warning(
+        # 等级变化时通知一次；DANGER/CRITICAL 持续状态每60秒重复告警
+        should_notify = (
+            (new_level != old_level and new_level != MarginLevel.NORMAL)
+            or self._should_repeat_margin_alert("HL", new_level)
+        )
+        if should_notify:
+            await self.margin_notifier.notify_margin_warning(
                 account_name="HL",
                 level=new_level,
                 margin_ratio=self.position_manager.hl_margin.margin_ratio,
@@ -550,6 +733,20 @@ class SilverHedgeBot:
                 balance=account_value,
                 available=withdrawable,
             )
+
+    def _should_repeat_margin_alert(self, account_name: str, level: str) -> bool:
+        """DANGER/CRITICAL level repeats every 60s; reset timer once risk is cleared."""
+        if level in (MarginLevel.DANGER, MarginLevel.CRITICAL):
+            now = time.time()
+            last = self._margin_risk_last_notified.get(account_name, 0.0)
+            if now - last >= 60:
+                self._margin_risk_last_notified[account_name] = now
+                return True
+            return False
+
+        # NORMAL/WARNING: clear repeat timer
+        self._margin_risk_last_notified[account_name] = 0.0
+        return False
 
     async def _save_state_loop(self):
         """Persist runtime state every minute."""
@@ -596,9 +793,11 @@ class SilverHedgeBot:
         """Run periodic health checks and alerts."""
         while self._running:
             issues = []
+            current_session = self.session_mgr.get_session_type()
+            in_session = current_session != SessionType.CLOSED
 
             # CTP 连接
-            if not self.ctp_gateway.is_connected:
+            if in_session and not self.ctp_gateway.is_connected:
                 issues.append("CTP 网关断开")
 
             # HL/AG 数据新鲜度
@@ -607,7 +806,7 @@ class SilverHedgeBot:
                 if latest.hl_stale:
                     hl_age = self.data_engine.hl_last_update_age
                     issues.append(f"HL 价格过期 ({hl_age:.0f}s)")
-                if latest.ag_stale:
+                if in_session and latest.ag_stale:
                     issues.append("AG 行情过期")
 
             # 汇率
@@ -625,10 +824,44 @@ class SilverHedgeBot:
             if issues:
                 msg = "健康检查异常:\n" + "\n".join(f"- {i}" for i in issues)
                 logger.warning(msg)
-                if any(kw in msg for kw in ("disconnect", "emergency")):
+                if any(kw in msg for kw in ("断开", "紧急")):
                     await self.notifier.notify_emergency(msg)
 
             await asyncio.sleep(60)
+
+    async def _md_watchdog_loop(self):
+        """During trading sessions, reconnect CTP if AG ticks stop updating for too long."""
+        while self._running:
+            try:
+                session_type = self.session_mgr.get_session_type()
+                if session_type == SessionType.CLOSED:
+                    await asyncio.sleep(5)
+                    continue
+
+                if not self.ctp_gateway.is_connected:
+                    await asyncio.sleep(5)
+                    continue
+
+                threshold = max(5, int(RISK.md_watchdog_no_tick_sec))
+                age = self.data_engine.ag_last_tick_age
+                if age < 0 and self._ctp_connected_at > 0:
+                    age = time.time() - self._ctp_connected_at
+
+                if age >= threshold:
+                    detail = (
+                        f"MD watchdog触发: AG连续{age:.0f}s无新tick(阈值{threshold}s), "
+                        f"session={session_type.value}, 自动重连CTP"
+                    )
+                    logger.warning(detail)
+                    if self._should_send_alert(
+                        "md_watchdog",
+                        max(60, int(RISK.md_watchdog_alert_cooldown_sec)),
+                    ):
+                        await self.notifier.notify_error(detail, "SILVER")
+                    await self._reconnect_ctp_stream("md_watchdog_no_tick")
+            except Exception as e:
+                logger.warning(f"MD watchdog异常: {e}")
+            await asyncio.sleep(5)
 
     async def _session_transition_loop(self):
         """Detect trading-session transitions and send Feishu notifications."""
@@ -643,8 +876,10 @@ class SilverHedgeBot:
                     continue
 
                 if previous == SessionType.CLOSED and current != SessionType.CLOSED:
+                    await self._ensure_ctp_online_for_session()
                     await self._notify_session_transition("START", current)
                 elif previous != SessionType.CLOSED and current == SessionType.CLOSED:
+                    await self._pause_ctp_for_closed_session()
                     await self._notify_session_transition("END", previous)
             except Exception as e:
                 logger.warning(f"交易时段切换通知异常: {e}")
@@ -675,12 +910,15 @@ class SilverHedgeBot:
             writer.writerow([
                 "timestamp",
                 "mode",
+                "signal_id",
                 "pair",
                 "signal",
                 "lots",
                 "status",
                 "fee_rmb",
                 "reason",
+                "remote_last_ok_ts",
+                "remote_last_err",
                 "ag_price",
                 "hl_price_usd",
                 "hl_price_cny_kg",
@@ -698,16 +936,20 @@ class SilverHedgeBot:
         fee_rmb: float,
         reason: str,
         signal_data: SignalResult,
+        signal_id: str = "",
     ):
         row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "DRY_RUN" if RUNTIME.dry_run else "LIVE",
+            signal_id,
             "SILVER",
             signal,
             f"{lots:.4f}",
             status,
             f"{fee_rmb:.2f}",
             reason,
+            self._last_remote_ok_ts,
+            self._last_remote_err,
             f"{signal_data.ag_price:.4f}",
             f"{signal_data.hl_price_usd_oz:.6f}",
             f"{signal_data.hl_price_cny_kg:.4f}",
@@ -742,7 +984,9 @@ class SilverHedgeBot:
                     f"window={self.signal_engine.sample_count}/{self.signal_engine.window_size} "
                     f"z={zscore:.2f} spread={(spread if spread is not None else 0):.3f}% "
                     f"AG={(ag if ag is not None else 0):.1f} HL={(hl_usd if hl_usd is not None else 0):.4f} "
-                    f"decisions_30m={stats_snapshot}"
+                    f"decisions_30m={stats_snapshot} "
+                    f"remote_last_ok={self._last_remote_ok_ts or 'N/A'} "
+                    f"remote_last_err={self._last_remote_err or 'N/A'}"
                 )
 
                 await self.notifier.notify_status_heartbeat(
@@ -766,6 +1010,42 @@ class SilverHedgeBot:
 
             await asyncio.sleep(1800)
 
+    async def _market_snapshot_loop(self):
+        """Emit market snapshot every minute for operator visibility."""
+        while self._running:
+            try:
+                latest = self.data_engine.latest
+                session_type = self.session_mgr.get_session_type().value
+                window = f"{self.signal_engine.sample_count}/{self.signal_engine.window_size}"
+                zscore = self.signal_engine.get_current_zscore()
+
+                if not latest:
+                    logger.info(
+                        "行情快照: latest=N/A "
+                        f"session={session_type} window={window} "
+                        f"data_ready={self.signal_engine.data_ready}"
+                    )
+                else:
+                    spread = (
+                        (latest.ag_price - latest.hl_price_cny_kg) / latest.hl_price_cny_kg * 100
+                        if latest.hl_price_cny_kg > 0 else 0.0
+                    )
+                    logger.info(
+                        "行情快照: "
+                        f"AG={latest.ag_price:.1f} CNY/kg "
+                        f"HL={latest.hl_price_usd:.4f} USD/oz "
+                        f"HL_CNY={latest.hl_price_cny_kg:.1f} CNY/kg "
+                        f"USDCNY={latest.usdcny:.4f} "
+                        f"spread={spread:.3f}% z={zscore:.2f} "
+                        f"window={window} "
+                        f"session={session_type} "
+                        f"stale(ag={latest.ag_stale},hl={latest.hl_stale},fx={latest.forex_stale})"
+                    )
+            except Exception as e:
+                logger.warning(f"行情快照日志异常: {e}")
+
+            await asyncio.sleep(60)
+
     async def shutdown(self):
         """Graceful shutdown."""
         logger.info("正在关闭...")
@@ -777,12 +1057,14 @@ class SilverHedgeBot:
             direction=self.signal_engine.position,
             lots=self.position_manager.current_lots,
         )
+        self.signal_engine.save_window_state()
         self.risk_manager.save_state()
 
         await self.data_engine.stop()
         await self.ctp_gateway.close()
         await self.hl_client.close()
         await self.notifier.close()
+        await self.margin_notifier.close()
 
         logger.info("关闭完成")
 

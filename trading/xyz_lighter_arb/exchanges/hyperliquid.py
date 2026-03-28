@@ -19,9 +19,10 @@ logger = logging.getLogger(__name__)
 class HyperliquidClient:
     """Hyperliquid API 客户端"""
 
-    def __init__(self, api_url: str, ws_url: str, private_key: str, wallet_address: str):
+    def __init__(self, api_url: str, ws_url: str, dex: str = "", private_key: str = "", wallet_address: str = ""):
         self.api_url = api_url
         self.ws_url = ws_url
+        self.dex = dex
         self.private_key = private_key
         self.wallet_address = wallet_address
         self.account = Account.from_key(private_key) if private_key else None
@@ -33,6 +34,7 @@ class HyperliquidClient:
 
         # asset_id 缓存
         self._asset_id_cache: Dict[str, int] = {}
+        self._dex_index: Optional[int] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -53,9 +55,12 @@ class HyperliquidClient:
     async def get_all_mids(self) -> Dict[str, float]:
         """获取所有交易对的中间价"""
         session = await self._get_session()
+        body = {"type": "allMids"}
+        if self.dex:
+            body["dex"] = self.dex
         async with session.post(
             f"{self.api_url}/info",
-            json={"type": "allMids"}
+            json=body
         ) as resp:
             data = await resp.json()
             return {k: float(v) for k, v in data.items()}
@@ -261,19 +266,49 @@ class HyperliquidClient:
 
         session = await self._get_session()
 
+        if self.dex:
+            self._dex_index = await self._get_dex_index()
+
         # 查询永续合约 meta
+        body = {"type": "metaAndAssetCtxs"}
+        if self.dex:
+            body["dex"] = self.dex
         async with session.post(
             f"{self.api_url}/info",
-            json={"type": "metaAndAssetCtxs"}
+            json=body
         ) as resp:
             data = await resp.json()
 
         universe = data[0].get("universe", []) if isinstance(data, list) else []
         for i, asset in enumerate(universe):
             name = asset.get("name", "")
-            self._asset_id_cache[name] = i
+            asset_id = i
+            if self.dex and self._dex_index is not None:
+                # builder deployed perp dex asset id format
+                # 100000 + dex_index*10000 + index_in_universe
+                asset_id = 100000 + self._dex_index * 10000 + i
+
+            self._asset_id_cache[name] = asset_id
+            if ":" in name:
+                self._asset_id_cache[name.split(":", 1)[1]] = asset_id
+            elif self.dex:
+                self._asset_id_cache[f"{self.dex}:{name}"] = asset_id
 
         logger.info(f"Cached {len(self._asset_id_cache)} asset IDs")
+
+    async def _get_dex_index(self) -> Optional[int]:
+        session = await self._get_session()
+        async with session.post(
+            f"{self.api_url}/info",
+            json={"type": "perpDexs"}
+        ) as resp:
+            data = await resp.json()
+        if not isinstance(data, list):
+            return None
+        for i, item in enumerate(data):
+            if isinstance(item, dict) and item.get("name") == self.dex:
+                return i
+        return None
 
     def _coin_to_asset_id(self, coin: str) -> int:
         """查找 coin → asset_id"""
@@ -291,9 +326,12 @@ class HyperliquidClient:
     async def get_funding_rate(self, coin: str) -> float:
         """获取指定合约的当前 funding rate"""
         session = await self._get_session()
+        body = {"type": "metaAndAssetCtxs"}
+        if self.dex:
+            body["dex"] = self.dex
         async with session.post(
             f"{self.api_url}/info",
-            json={"type": "metaAndAssetCtxs"}
+            json=body
         ) as resp:
             data = await resp.json()
 
@@ -303,9 +341,13 @@ class HyperliquidClient:
         universe = data[0].get("universe", [])
         ctxs = data[1]
 
-        name = coin.replace("xyz:", "")
+        name = coin
+        if self.dex and ":" not in name:
+            name = f"{self.dex}:{name}"
+
         for i, asset in enumerate(universe):
-            if asset.get("name") == name and i < len(ctxs):
+            asset_name = asset.get("name")
+            if asset_name == name and i < len(ctxs):
                 return float(ctxs[i].get("funding", 0))
 
         return 0.0
