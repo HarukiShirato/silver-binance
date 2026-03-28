@@ -160,7 +160,7 @@ def _load_hl_key_from_aws_secret(secret_id: str, region: str) -> str:
         import json
 
         obj = json.loads(secret)
-        for k in ("HL_API_WALLET_PRIVATE_KEY", "private_key", "key", "secret"):
+        for k in ("private_key", "key", "secret"):
             v = obj.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
@@ -172,7 +172,7 @@ def load_api_keys(dry_run: bool = False, hl_exec_mode: str = "local"):
     """从环境变量（或 AWS Secrets Manager）加载敏感信息"""
     # Hyperliquid
     API.hl_dex = os.environ.get('HL_DEX', API.hl_dex)
-    API.hl_api_wallet_private_key = os.environ.get('HL_API_WALLET_PRIVATE_KEY', '').strip()
+    API.hl_api_wallet_private_key = ""
     API.hl_wallet_address = os.environ.get('HL_WALLET_ADDRESS', '').strip()
     API.hl_api_wallet_secret_id = os.environ.get('HL_API_WALLET_SECRET_ID', '').strip()
     API.aws_region = (
@@ -182,7 +182,12 @@ def load_api_keys(dry_run: bool = False, hl_exec_mode: str = "local"):
 
     # Only resolve secret when key is needed.
     needs_hl_key = (not dry_run) and (hl_exec_mode != "remote")
-    if needs_hl_key and (not API.hl_api_wallet_private_key) and API.hl_api_wallet_secret_id:
+    if needs_hl_key:
+        if not API.hl_api_wallet_secret_id:
+            raise EnvironmentError(
+                "缺少必要环境变量: HL_API_WALLET_SECRET_ID. "
+                "LIVE本地HL模式下必须通过 AWS Secrets Manager 提供私钥。"
+            )
         API.hl_api_wallet_private_key = _load_hl_key_from_aws_secret(
             API.hl_api_wallet_secret_id,
             API.aws_region,
@@ -236,7 +241,7 @@ def validate_api_keys(dry_run: bool = False, hl_exec_mode: str = "local"):
     needs_hl_key = (not dry_run) and (hl_exec_mode != "remote")
     if needs_hl_key:
         if not API.hl_api_wallet_private_key:
-            missing.append('HL_API_WALLET_PRIVATE_KEY')
+            missing.append('HL_API_WALLET_SECRET_ID(secret)')
         if not API.hl_wallet_address:
             missing.append('HL_WALLET_ADDRESS')
     if missing:
