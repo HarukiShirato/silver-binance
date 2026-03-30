@@ -1,0 +1,143 @@
+name: Deploy To Servers
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy-ecs:
+    if: ${{ secrets.ECS_HOST != '' && secrets.ECS_USER != '' && secrets.ECS_SSH_KEY != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TARGET_NAME: aliyun-ecs
+      TARGET_HOST: ${{ secrets.ECS_HOST }}
+      TARGET_USER: ${{ secrets.ECS_USER }}
+      TARGET_PORT: ${{ secrets.ECS_PORT || '22' }}
+      TARGET_PROJECT_DIR: ${{ secrets.ECS_PROJECT_DIR || '/home/ubuntu/arbitrage_bot' }}
+      TARGET_SERVICE_NAME: ${{ secrets.ECS_SERVICE_NAME || 'arbitrage-bot' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ECS_SSH_KEY }}
+
+      - name: Add target to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "$TARGET_PORT" -H "$TARGET_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync project files
+        run: |
+          rsync -az --delete \
+            --exclude '.env' \
+            --exclude 'venv/' \
+            --exclude '__pycache__/' \
+            --exclude '*.pyc' \
+            --exclude 'logs/' \
+            --exclude 'data/' \
+            -e "ssh -p $TARGET_PORT" \
+            trading/xyz_lighter_arb/ "${TARGET_USER}@${TARGET_HOST}:${TARGET_PROJECT_DIR}/"
+
+      - name: Install dependencies and restart service
+        run: |
+          ssh -p "$TARGET_PORT" "${TARGET_USER}@${TARGET_HOST}" <<EOF
+          set -e
+          cd "$TARGET_PROJECT_DIR"
+
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 is not installed on $TARGET_NAME"
+            exit 1
+          fi
+
+          mkdir -p logs data
+
+          if [ ! -d venv ]; then
+            python3 -m venv venv
+          fi
+
+          . venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+          if systemctl list-unit-files | grep -q "^${TARGET_SERVICE_NAME}.service"; then
+            sudo systemctl daemon-reload
+            sudo systemctl restart "$TARGET_SERVICE_NAME"
+            sudo systemctl status "$TARGET_SERVICE_NAME" --no-pager
+          else
+            echo "Systemd service ${TARGET_SERVICE_NAME}.service not found on $TARGET_NAME. Files synced only."
+          fi
+          EOF
+
+  deploy-aws-ec2:
+    if: ${{ secrets.AWS_EC2_HOST != '' && secrets.AWS_EC2_USER != '' && secrets.AWS_EC2_SSH_KEY != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TARGET_NAME: aws-ec2
+      TARGET_HOST: ${{ secrets.AWS_EC2_HOST }}
+      TARGET_USER: ${{ secrets.AWS_EC2_USER }}
+      TARGET_PORT: ${{ secrets.AWS_EC2_PORT || '22' }}
+      TARGET_PROJECT_DIR: ${{ secrets.AWS_EC2_PROJECT_DIR || '/home/ec2-user/arbitrage_bot' }}
+      TARGET_SERVICE_NAME: ${{ secrets.AWS_EC2_SERVICE_NAME || 'arbitrage-bot' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AWS_EC2_SSH_KEY }}
+
+      - name: Add target to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "$TARGET_PORT" -H "$TARGET_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync project files
+        run: |
+          rsync -az --delete \
+            --exclude '.env' \
+            --exclude 'venv/' \
+            --exclude '__pycache__/' \
+            --exclude '*.pyc' \
+            --exclude 'logs/' \
+            --exclude 'data/' \
+            -e "ssh -p $TARGET_PORT" \
+            trading/xyz_lighter_arb/ "${TARGET_USER}@${TARGET_HOST}:${TARGET_PROJECT_DIR}/"
+
+      - name: Install dependencies and restart service
+        run: |
+          ssh -p "$TARGET_PORT" "${TARGET_USER}@${TARGET_HOST}" <<EOF
+          set -e
+          cd "$TARGET_PROJECT_DIR"
+
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 is not installed on $TARGET_NAME"
+            exit 1
+          fi
+
+          mkdir -p logs data
+
+          if [ ! -d venv ]; then
+            python3 -m venv venv
+          fi
+
+          . venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+          if systemctl list-unit-files | grep -q "^${TARGET_SERVICE_NAME}.service"; then
+            sudo systemctl daemon-reload
+            sudo systemctl restart "$TARGET_SERVICE_NAME"
+            sudo systemctl status "$TARGET_SERVICE_NAME" --no-pager
+          else
+            echo "Systemd service ${TARGET_SERVICE_NAME}.service not found on $TARGET_NAME. Files synced only."
+          fi
+          EOF
