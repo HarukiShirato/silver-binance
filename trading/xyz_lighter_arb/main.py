@@ -1070,22 +1070,38 @@ class SilverHedgeBot:
 
 
 async def main():
-    bot = SilverHedgeBot()
-
     loop = asyncio.get_event_loop()
+    stop_requested = False
+    current_bot = None
+
     def signal_handler():
-        asyncio.create_task(bot.shutdown())
+        nonlocal stop_requested, current_bot
+        stop_requested = True
+        if current_bot is not None:
+            asyncio.create_task(current_bot.shutdown())
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, signal_handler)
 
-    try:
-        await bot.initialize()
-        await bot.run()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await bot.shutdown()
+    while not stop_requested:
+        bot = SilverHedgeBot()
+        current_bot = bot
+        try:
+            await bot.initialize()
+            await bot.run()
+        except KeyboardInterrupt:
+            stop_requested = True
+        except Exception as e:
+            logger.exception(f"主循环异常: {e}")
+            if not stop_requested:
+                # 避免初始化失败时进程退出，让程序在后台持续自愈重试
+                await asyncio.sleep(15)
+        finally:
+            try:
+                await bot.shutdown()
+            except Exception as e:
+                logger.warning(f"关闭流程异常(忽略): {e}")
+            current_bot = None
 
 
 if __name__ == "__main__":
