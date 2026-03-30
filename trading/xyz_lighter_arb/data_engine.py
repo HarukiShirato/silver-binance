@@ -6,6 +6,9 @@
 import asyncio
 import json
 import time
+import urllib.parse
+import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from typing import Optional, Callable, Any, List
 
@@ -55,12 +58,20 @@ class DataEngine:
         forex_feed: ForexFeed,
         session_manager: SessionManager,
         pair: TradingPair,
+        hl_data_mode: str = "local",
+        remote_quote_url: str = "",
+        remote_quote_timeout_sec: float = 1.0,
+        remote_quote_poll_sec: float = 1.0,
     ):
         self._ctp = ctp_gateway
         self._hl = hl_client
         self._forex = forex_feed
         self._session_mgr = session_manager
         self._pair = pair
+        self._hl_data_mode = (hl_data_mode or "local").strip().lower()
+        self._remote_quote_url = (remote_quote_url or "").strip()
+        self._remote_quote_timeout_sec = max(0.2, float(remote_quote_timeout_sec))
+        self._remote_quote_poll_sec = max(0.2, float(remote_quote_poll_sec))
 
         # 最新数据
         self._ag_tick: Optional[TickData] = None
@@ -107,8 +118,19 @@ class DataEngine:
         else:
             logger.info("当前未启用 CTP 行情订阅（等待交易时段）")
 
-        # 2. HL: 启动 WebSocket 获取实时价格
-        asyncio.create_task(self._run_hl_ws())
+        # 2. HL: 启动远程行情拉取或本地 WebSocket
+        if self._hl_data_mode == "remote":
+            if not self._remote_quote_url:
+                raise ValueError("HL_DATA_MODE=remote but HL_REMOTE_QUOTE_URL is empty")
+            asyncio.create_task(self._run_hl_remote_quote())
+            logger.info(
+                "HL data source: remote quote "
+                f"url={self._remote_quote_url} "
+                f"poll={self._remote_quote_poll_sec:.2f}s timeout={self._remote_quote_timeout_sec:.2f}s"
+            )
+        else:
+            asyncio.create_task(self._run_hl_ws())
+            logger.info("HL data source: local websocket")
 
         # 3. 汇率: 启动定时获取
         asyncio.create_task(self._forex.start())
@@ -173,6 +195,62 @@ class DataEngine:
                     logger.error(f"HL WebSocket 错误: {e}, {backoff}s 后重连")
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, max_backoff)
+
+    async def _run_hl_remote_quote(self):
+        """从东京网关轮询 HL 行情。"""
+        hl_symbol = self._pair.hl_symbol
+        backoff = 1.0
+        max_backoff = 10.0
+
+        while self._running:
+            try:
+                query = urllib.parse.urlencode({"symbol": hl_symbol})
+                req = urllib.request.Request(
+                    url=f"{self._remote_quote_url}?{query}",
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=self._remote_quote_timeout_sec) as resp:
+                    status = int(getattr(resp, "status", 200))
+                    if status < 200 or status >= 300:
+                        raise RuntimeError(f"HTTP {status}")
+
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if not data.get("ok", False):
+                        raise RuntimeError(f"quote not ok: {data}")
+
+                    price = float(data.get("price", 0) or 0)
+                    if price <= 0:
+                        raise RuntimeError(f"invalid quote price: {price}")
+
+                    src_ts = data.get("ts")
+                    if isinstance(src_ts, (int, float)) and src_ts > 0:
+                        self._hl_update_time = float(src_ts)
+                    else:
+                        self._hl_update_time = time.time()
+                    self._hl_mid = price
+
+                    if data.get("stale"):
+                        logger.warning(
+                            "HL remote quote stale: "
+                            f"symbol={data.get('symbol')} age={data.get('age_sec')}s"
+                        )
+
+                    await self._emit_price()
+                    backoff = 1.0
+            except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, ValueError, RuntimeError) as e:
+                if self._running:
+                    logger.warning(f"HL remote quote error: {e}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
+            except Exception as e:
+                if self._running:
+                    logger.warning(f"HL remote quote unexpected error: {e}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
+
+            await asyncio.sleep(self._remote_quote_poll_sec)
 
     async def _emit_price(self):
         """构建 NormalizedPrice 并通知回调"""

@@ -118,6 +118,10 @@ class RuntimeConfig:
     hl_exec_mode: str = "local"          # local | remote
     hl_remote_url: str = ""              # e.g. http://52.193.85.209:18080
     remote_exec_timeout_sec: float = 2.0
+    hl_data_mode: str = "local"          # local | remote
+    hl_remote_quote_url: str = ""        # e.g. http://52.193.85.209:18080/quote
+    remote_quote_timeout_sec: float = 1.0
+    remote_quote_poll_sec: float = 1.0
 
 
 RUNTIME = RuntimeConfig()
@@ -127,12 +131,40 @@ def load_runtime_config():
     RUNTIME.dry_run = _env_bool("DRY_RUN", True)
     RUNTIME.hl_exec_mode = os.environ.get("HL_EXEC_MODE", RUNTIME.hl_exec_mode).strip().lower()
     RUNTIME.hl_remote_url = os.environ.get("HL_REMOTE_URL", RUNTIME.hl_remote_url).strip()
+    RUNTIME.hl_data_mode = os.environ.get("HL_DATA_MODE", RUNTIME.hl_data_mode).strip().lower()
+    RUNTIME.hl_remote_quote_url = os.environ.get("HL_REMOTE_QUOTE_URL", RUNTIME.hl_remote_quote_url).strip()
     timeout = os.environ.get("REMOTE_EXEC_TIMEOUT_SEC")
     if timeout:
         try:
             RUNTIME.remote_exec_timeout_sec = float(timeout)
         except ValueError:
             pass
+    quote_timeout = os.environ.get("REMOTE_QUOTE_TIMEOUT_SEC")
+    if quote_timeout:
+        try:
+            RUNTIME.remote_quote_timeout_sec = float(quote_timeout)
+        except ValueError:
+            pass
+    quote_poll = os.environ.get("REMOTE_QUOTE_POLL_SEC")
+    if quote_poll:
+        try:
+            RUNTIME.remote_quote_poll_sec = float(quote_poll)
+        except ValueError:
+            pass
+
+    if (
+        RUNTIME.hl_data_mode == "remote"
+        and not RUNTIME.hl_remote_quote_url
+        and RUNTIME.hl_remote_url
+    ):
+        RUNTIME.hl_remote_quote_url = RUNTIME.hl_remote_url.rstrip("/") + "/quote"
+
+    if RUNTIME.hl_exec_mode not in ("local", "remote"):
+        logger.warning(f"Unknown HL_EXEC_MODE={RUNTIME.hl_exec_mode}, fallback to local")
+        RUNTIME.hl_exec_mode = "local"
+    if RUNTIME.hl_data_mode not in ("local", "remote"):
+        logger.warning(f"Unknown HL_DATA_MODE={RUNTIME.hl_data_mode}, fallback to local")
+        RUNTIME.hl_data_mode = "local"
 
 
 def _load_hl_key_from_aws_secret(secret_id: str, region: str) -> str:

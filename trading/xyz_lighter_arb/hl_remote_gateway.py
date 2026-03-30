@@ -1,17 +1,35 @@
 #!/usr/bin/env python3
-"""
-Minimal remote execution gateway for Tokyo node.
-Current behavior: accept /exec and return ACK (dry-run relay test).
-"""
+"""Remote execution + quote gateway for Tokyo node."""
 
 import json
 import os
 import time
+import threading
+import urllib.parse
+import urllib.request
+from typing import Optional, Dict, Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG_DIR = "logs"
 EVENT_LOG = os.path.join(LOG_DIR, "hl_gateway_events.jsonl")
 os.makedirs(LOG_DIR, exist_ok=True)
+
+HL_API_URL = os.environ.get("HL_API_URL", "https://api.hyperliquid.xyz").strip()
+HL_DEX = os.environ.get("HL_DEX", "xyz").strip()
+DEFAULT_SYMBOL = os.environ.get("HL_QUOTE_SYMBOL", "SILVER").strip() or "SILVER"
+QUOTE_POLL_SEC = max(0.2, float(os.environ.get("HL_QUOTE_POLL_SEC", "0.5")))
+QUOTE_STALE_SEC = max(1.0, float(os.environ.get("HL_QUOTE_STALE_SEC", "5")))
+
+_quote_lock = threading.Lock()
+_quote_state: Dict[str, Any] = {
+    "ok": False,
+    "symbol": f"{HL_DEX}:{DEFAULT_SYMBOL}" if HL_DEX and ":" not in DEFAULT_SYMBOL else DEFAULT_SYMBOL,
+    "price": 0.0,
+    "ts": 0.0,
+    "source": "hyperliquid_allMids",
+    "error": "",
+}
+_last_quote_req_log_ts = 0.0
 
 
 def _append_event(event: dict):
@@ -21,10 +39,93 @@ def _append_event(event: dict):
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
+def _normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip() or DEFAULT_SYMBOL
+    if HL_DEX and ":" not in s:
+        s = f"{HL_DEX}:{s}"
+    return s
+
+
+def _fetch_all_mids() -> Dict[str, Any]:
+    payload = {"type": "allMids"}
+    if HL_DEX:
+        payload["dex"] = HL_DEX
+
+    req = urllib.request.Request(
+        url=f"{HL_API_URL.rstrip('/')}/info",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _quote_updater():
+    symbol = _normalize_symbol(DEFAULT_SYMBOL)
+    while True:
+        try:
+            mids = _fetch_all_mids()
+            price = float(mids.get(symbol, 0) or 0)
+            if price <= 0:
+                raise RuntimeError(f"symbol not found in allMids: {symbol}")
+
+            now = time.time()
+            with _quote_lock:
+                _quote_state.update(
+                    {
+                        "ok": True,
+                        "symbol": symbol,
+                        "price": price,
+                        "ts": now,
+                        "source": "hyperliquid_allMids",
+                        "error": "",
+                    }
+                )
+        except Exception as e:
+            with _quote_lock:
+                _quote_state["ok"] = False
+                _quote_state["error"] = str(e)
+            _append_event({"event": "quote_update_error", "error": str(e)})
+        time.sleep(QUOTE_POLL_SEC)
+
+
+def _get_quote(symbol: str) -> Dict[str, Any]:
+    requested_symbol = _normalize_symbol(symbol)
+    with _quote_lock:
+        state = dict(_quote_state)
+
+    # Current updater tracks one symbol only.
+    if requested_symbol != state.get("symbol"):
+        return {
+            "ok": False,
+            "error": f"unsupported symbol: {requested_symbol}, only {state.get('symbol')} is available",
+            "symbol": requested_symbol,
+            "ts": time.time(),
+        }
+
+    now = time.time()
+    ts = float(state.get("ts", 0) or 0)
+    age = now - ts if ts > 0 else 1e9
+    stale = age > QUOTE_STALE_SEC
+
+    return {
+        "ok": bool(state.get("ok", False)),
+        "symbol": state.get("symbol"),
+        "price": float(state.get("price", 0) or 0),
+        "ts": ts,
+        "age_sec": round(age, 3),
+        "stale": stale,
+        "source": state.get("source", "unknown"),
+        "error": state.get("error", ""),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "HLRemoteGateway/0.1"
 
     def do_GET(self):
+        global _last_quote_req_log_ts
         if self.path == "/health":
             msg = f"[HL-GW] health check from {self.client_address[0]}:{self.client_address[1]}"
             print(msg)
@@ -38,6 +139,37 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._send(200, {"ok": True, "ts": time.time()})
             return
+
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/quote":
+            query = urllib.parse.parse_qs(parsed.query or "")
+            symbol = (query.get("symbol") or [DEFAULT_SYMBOL])[0]
+            quote = _get_quote(symbol)
+
+            now = time.time()
+            if now - _last_quote_req_log_ts >= 30:
+                _last_quote_req_log_ts = now
+                print(
+                    f"[HL-GW] quote from {self.client_address[0]} "
+                    f"symbol={quote.get('symbol')} ok={quote.get('ok')} stale={quote.get('stale')}"
+                )
+
+            _append_event(
+                {
+                    "event": "quote",
+                    "client_ip": self.client_address[0],
+                    "client_port": self.client_address[1],
+                    "path": self.path,
+                    "symbol": quote.get("symbol"),
+                    "ok": quote.get("ok"),
+                    "stale": quote.get("stale"),
+                    "age_sec": quote.get("age_sec"),
+                }
+            )
+            code = 200 if quote.get("ok") else 503
+            self._send(code, quote)
+            return
+
         self._send(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
@@ -100,8 +232,13 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     host = "0.0.0.0"
     port = 18080
+    updater = threading.Thread(target=_quote_updater, daemon=True)
+    updater.start()
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"HL remote gateway listening on {host}:{port}")
+    print(
+        f"HL remote gateway listening on {host}:{port} "
+        f"(quote_symbol={_normalize_symbol(DEFAULT_SYMBOL)}, poll={QUOTE_POLL_SEC}s)"
+    )
     server.serve_forever()
 
 
