@@ -85,6 +85,10 @@ class SilverHedgeBot:
             forex_feed=self.forex_feed,
             session_manager=self.session_mgr,
             pair=pair,
+            hl_data_mode=RUNTIME.hl_data_mode,
+            remote_quote_url=RUNTIME.hl_remote_quote_url,
+            remote_quote_timeout_sec=RUNTIME.remote_quote_timeout_sec,
+            remote_quote_poll_sec=RUNTIME.remote_quote_poll_sec,
         )
         self.signal_engine = SignalEngine(
             pair_name='SILVER',
@@ -238,6 +242,8 @@ class SilverHedgeBot:
             f"mode={'DRY_RUN' if RUNTIME.dry_run else 'LIVE'} "
             f"hl_exec_mode={RUNTIME.hl_exec_mode} "
             f"hl_remote_url={RUNTIME.hl_remote_url or 'N/A'} "
+            f"hl_data_mode={RUNTIME.hl_data_mode} "
+            f"hl_remote_quote_url={RUNTIME.hl_remote_quote_url or 'N/A'} "
             f"entry_z={STRATEGY.entry_zscore} exit_z={STRATEGY.exit_zscore} stop_z={STRATEGY.stop_loss_zscore} "
             f"window={STRATEGY.spread_window} sample_interval={STRATEGY.sample_interval}s "
             f"max_lots={STRATEGY.max_position_lots} emergency_spread_pct={RISK.emergency_spread_pct} "
