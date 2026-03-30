@@ -7,7 +7,6 @@ on:
 
 jobs:
   deploy-ecs:
-    if: ${{ secrets.ECS_HOST != '' && secrets.ECS_USER != '' && secrets.ECS_SSH_KEY != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -19,20 +18,31 @@ jobs:
       TARGET_SERVICE_NAME: ${{ secrets.ECS_SERVICE_NAME || 'arbitrage-bot' }}
 
     steps:
+      - name: Check secrets
+        id: check
+        run: |
+          if [ -z "${{ secrets.ECS_HOST }}" ] || [ -z "${{ secrets.ECS_USER }}" ] || [ -z "${{ secrets.ECS_SSH_KEY }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
 
       - name: Start SSH agent
+        if: steps.check.outputs.skip != 'true'
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.ECS_SSH_KEY }}
 
       - name: Add target to known_hosts
+        if: steps.check.outputs.skip != 'true'
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -p "$TARGET_PORT" -H "$TARGET_HOST" >> ~/.ssh/known_hosts
 
       - name: Sync project files
+        if: steps.check.outputs.skip != 'true'
         run: |
           rsync -az --delete \
             --exclude '.env' \
@@ -45,6 +55,7 @@ jobs:
             trading/xyz_lighter_arb/ "${TARGET_USER}@${TARGET_HOST}:${TARGET_PROJECT_DIR}/"
 
       - name: Install dependencies and restart service
+        if: steps.check.outputs.skip != 'true'
         run: |
           ssh -p "$TARGET_PORT" "${TARGET_USER}@${TARGET_HOST}" <<EOF
           set -e
@@ -75,7 +86,6 @@ jobs:
           EOF
 
   deploy-aws-ec2:
-    if: ${{ secrets.AWS_EC2_HOST != '' && secrets.AWS_EC2_USER != '' && secrets.AWS_EC2_SSH_KEY != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -87,20 +97,31 @@ jobs:
       TARGET_SERVICE_NAME: ${{ secrets.AWS_EC2_SERVICE_NAME || 'arbitrage-bot' }}
 
     steps:
+      - name: Check secrets
+        id: check
+        run: |
+          if [ -z "${{ secrets.AWS_EC2_HOST }}" ] || [ -z "${{ secrets.AWS_EC2_USER }}" ] || [ -z "${{ secrets.AWS_EC2_SSH_KEY }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
 
       - name: Start SSH agent
+        if: steps.check.outputs.skip != 'true'
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.AWS_EC2_SSH_KEY }}
 
       - name: Add target to known_hosts
+        if: steps.check.outputs.skip != 'true'
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -p "$TARGET_PORT" -H "$TARGET_HOST" >> ~/.ssh/known_hosts
 
       - name: Sync project files
+        if: steps.check.outputs.skip != 'true'
         run: |
           rsync -az --delete \
             --exclude '.env' \
@@ -113,6 +134,7 @@ jobs:
             trading/xyz_lighter_arb/ "${TARGET_USER}@${TARGET_HOST}:${TARGET_PROJECT_DIR}/"
 
       - name: Install dependencies and restart service
+        if: steps.check.outputs.skip != 'true'
         run: |
           ssh -p "$TARGET_PORT" "${TARGET_USER}@${TARGET_HOST}" <<EOF
           set -e
