@@ -304,3 +304,83 @@ class FeishuNotifier:
         }
 
         await self.send_card(title, fields, color)
+
+    async def notify_session_transition(
+        self,
+        event: str,
+        session_type: str,
+        ag_price: float = None,
+        hl_price_usd: float = None,
+        hl_price_cny_kg: float = None,
+        usdcny: float = None,
+    ):
+        """交易时段切换通知。"""
+        is_start = str(event).upper() == "START"
+        title = ("🟢 进入交易时段" if is_start else "⏸ 交易时段结束")
+        color = "green" if is_start else "grey"
+
+        fields = {
+            "事件": "START" if is_start else "END",
+            "时段": session_type,
+            "AG价格": f"{ag_price:.1f} CNY/kg" if ag_price is not None else "N/A",
+            "HL价格(USD)": f"{hl_price_usd:.4f} USD/oz" if hl_price_usd is not None else "N/A",
+            "HL价格(CNY)": f"{hl_price_cny_kg:.1f} CNY/kg" if hl_price_cny_kg is not None else "N/A",
+            "USD/CNY": f"{usdcny:.4f}" if usdcny is not None else "N/A",
+        }
+        await self.send_card(title, fields, color)
+
+    async def notify_window_full(
+        self,
+        pair_name: str,
+        sample_count: int,
+        window_size: int,
+        zscore: float = None,
+        spread_pct: float = None,
+        ag_price: float = None,
+        hl_price_usd: float = None,
+        hl_price_cny_kg: float = None,
+        usdcny: float = None,
+    ):
+        """信号窗口填满通知。"""
+        title = f"🧠 信号窗口就绪 - {pair_name}"
+        fields = {
+            "窗口进度": f"{sample_count}/{window_size}",
+            "当前Z-score": f"{zscore:.2f}" if zscore is not None else "N/A",
+            "当前价差": f"{spread_pct:.3f}%" if spread_pct is not None else "N/A",
+            "AG价格": f"{ag_price:.1f} CNY/kg" if ag_price is not None else "N/A",
+            "HL价格(USD)": f"{hl_price_usd:.4f} USD/oz" if hl_price_usd is not None else "N/A",
+            "HL价格(CNY)": f"{hl_price_cny_kg:.1f} CNY/kg" if hl_price_cny_kg is not None else "N/A",
+            "USD/CNY": f"{usdcny:.4f}" if usdcny is not None else "N/A",
+        }
+        await self.send_card(title, fields, "blue")
+
+    async def notify_status_heartbeat(
+        self,
+        mode: str,
+        session_type: str,
+        data_ready: bool,
+        sample_count: int,
+        window_size: int,
+        zscore: float = None,
+        spread_pct: float = None,
+        ag_price: float = None,
+        hl_price_usd: float = None,
+        hl_price_cny_kg: float = None,
+        usdcny: float = None,
+        decision_stats: dict = None,
+    ):
+        """30分钟状态心跳。"""
+        title = f"💓 状态心跳 ({mode})"
+        fields = {
+            "时段": session_type,
+            "数据就绪": str(bool(data_ready)),
+            "窗口进度": f"{sample_count}/{window_size}",
+            "当前Z-score": f"{zscore:.2f}" if zscore is not None else "N/A",
+            "当前价差": f"{spread_pct:.3f}%" if spread_pct is not None else "N/A",
+            "AG价格": f"{ag_price:.1f} CNY/kg" if ag_price is not None else "N/A",
+            "HL价格(USD)": f"{hl_price_usd:.4f} USD/oz" if hl_price_usd is not None else "N/A",
+            "HL价格(CNY)": f"{hl_price_cny_kg:.1f} CNY/kg" if hl_price_cny_kg is not None else "N/A",
+            "USD/CNY": f"{usdcny:.4f}" if usdcny is not None else "N/A",
+            "最近30m决策统计": str(decision_stats or {}),
+        }
+        await self.send_card(title, fields, "blue")
