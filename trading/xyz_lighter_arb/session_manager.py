@@ -51,16 +51,14 @@ class SessionManager:
                 if start <= t < end:
                     return SessionType.DAY
 
-        # 夜盘: 21:00~23:59 (周一到周五晚上开盘)
-        if weekday < 5 and t >= NIGHT_SESSION_START:
+        # 夜盘: 21:00~23:59
+        # 有夜盘开盘的日期: 周日~周四晚 (周五晚不开, 周六晚不开)
+        if (weekday == 6 or 0 <= weekday <= 3) and t >= NIGHT_SESSION_START:
             return SessionType.NIGHT
 
-        # 夜盘: 00:00~02:30 (周二到周六凌晨)
-        if 0 < weekday <= 5 and t < NIGHT_SESSION_END:
+        # 夜盘延续: 00:00~02:30 (周一到周五凌晨)
+        if 0 <= weekday <= 4 and t < NIGHT_SESSION_END:
             return SessionType.NIGHT
-        # 周一凌晨不开盘 (周日夜盘不存在)
-        if weekday == 0 and t < NIGHT_SESSION_END:
-            return SessionType.CLOSED
 
         return SessionType.CLOSED
 
@@ -144,10 +142,10 @@ class SessionManager:
             candidates.append(datetime.combine(tomorrow, start))
         candidates.append(datetime.combine(tomorrow, NIGHT_SESSION_START))
 
-        # 过滤掉周末
+        # 过滤掉闭市时间
         valid = []
         for c in candidates:
-            if c > dt and c.weekday() < 5:
+            if c > dt and self.get_session_type(c) != SessionType.CLOSED:
                 valid.append(c)
 
         if not valid:
