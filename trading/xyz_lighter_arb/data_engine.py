@@ -87,6 +87,8 @@ class DataEngine:
         # 状态
         self._running = False
         self._ctp_stream_active = False
+        self._remote_quote_ws_connected = False
+        self._remote_quote_ws_last_error = ""
 
     @property
     def latest(self) -> Optional[NormalizedPrice]:
@@ -105,6 +107,14 @@ class DataEngine:
         if self._ag_tick is None:
             return -1
         return time.time() - self._ag_tick.timestamp
+
+    @property
+    def remote_quote_ws_connected(self) -> bool:
+        return self._remote_quote_ws_connected
+
+    @property
+    def remote_quote_ws_last_error(self) -> str:
+        return self._remote_quote_ws_last_error
 
     def on_price(self, callback: Callable[[NormalizedPrice], Any]):
         """注册价格更新回调"""
@@ -225,6 +235,8 @@ class DataEngine:
 
                 async with websockets.connect(stream_url, ping_interval=15, ping_timeout=10) as ws:
                     logger.info(f"HL remote quote websocket connected: {self._remote_quote_ws_url}")
+                    self._remote_quote_ws_connected = True
+                    self._remote_quote_ws_last_error = ""
                     backoff = 1.0
                     async for message in ws:
                         if not self._running:
@@ -248,6 +260,8 @@ class DataEngine:
                         self._hl_mid = price
                         await self._emit_price()
             except Exception as e:
+                self._remote_quote_ws_connected = False
+                self._remote_quote_ws_last_error = str(e)
                 if self._running:
                     logger.warning(f"HL remote quote websocket error: {e}")
                     if self._remote_quote_url:
@@ -359,5 +373,6 @@ class DataEngine:
     async def stop(self):
         """停止"""
         self._running = False
+        self._remote_quote_ws_connected = False
         await self._forex.stop()
         logger.info("DataEngine 已停止")

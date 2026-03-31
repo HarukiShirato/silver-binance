@@ -93,7 +93,7 @@ class RiskManager:
 
         # 冷却期仅限制开仓，平仓信号不受冷却限制。
         is_entry_signal = signal in ("LONG", "SHORT") or signal == ""
-        if is_entry_signal and time.time() < self._cooldown_until:
+        if signal in ("LONG", "SHORT") and time.time() < self._cooldown_until:
             remaining = self._cooldown_until - time.time()
             return False, f"Cooldown period, {remaining:.0f}s remaining"
 

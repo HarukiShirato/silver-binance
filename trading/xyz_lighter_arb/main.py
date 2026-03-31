@@ -158,6 +158,7 @@ class SilverHedgeBot:
         self._ctp_reconnect_lock = asyncio.Lock()
         self._ctp_connected_at: float = 0.0
         self._ctp_paused_by_session = False
+        self._last_position_mismatch_msg = ""
 
     async def initialize(self):
         """Initialize exchanges and data sources."""
@@ -388,6 +389,36 @@ class SilverHedgeBot:
             f"spread={signal.spread_pct:.3f}% zscore={signal.zscore:.2f}"
         )
 
+        # 远端 HL Quote WS 断开时，禁止开新仓（平仓仍允许）
+        is_entry = signal.signal in (Signal.LONG, Signal.SHORT)
+        if (
+            is_entry
+            and RUNTIME.hl_data_mode == "remote"
+            and bool(RUNTIME.hl_remote_quote_ws_url)
+            and not self.data_engine.remote_quote_ws_connected
+        ):
+            reason = "hl_quote_ws_disconnected"
+            logger.warning(f"交易被阻止: {reason}")
+            self._decision_stats[f"blocked_{reason}"] += 1
+            self._append_trade_event(
+                signal=signal.signal.value,
+                lots=0,
+                status="blocked",
+                fee_rmb=0.0,
+                reason=reason,
+                signal_data=signal,
+                signal_id=signal_id,
+            )
+            if self._should_send_alert(
+                "hl_quote_ws_disconnected",
+                max(30, int(RISK.hl_quote_ws_down_alert_cooldown_sec)),
+            ):
+                await self.margin_notifier.notify_error(
+                    f"阻止开新仓: HL quote websocket 断开, last_err={self.data_engine.remote_quote_ws_last_error or 'N/A'}",
+                    "SILVER",
+                )
+            return
+
         # 椋庢帶妫€鏌?
         can_trade, reason = self.risk_manager.can_trade('SILVER', signal=signal.signal.value)
         if not can_trade:
@@ -423,7 +454,6 @@ class SilverHedgeBot:
             return
 
         # 璁＄畻鎵嬫暟
-        is_entry = signal.signal in (Signal.LONG, Signal.SHORT)
         if is_entry:
             lots = self.position_manager.calculate_order_lots(
                 ag_price_cny_kg=signal.ag_price,
@@ -635,6 +665,7 @@ class SilverHedgeBot:
             asyncio.create_task(self._daily_summary_loop()),
             asyncio.create_task(self._funding_rate_loop()),
             asyncio.create_task(self._margin_monitor_loop()),
+            asyncio.create_task(self._position_reconcile_loop()),
             asyncio.create_task(self._health_monitor_loop()),
             asyncio.create_task(self._md_watchdog_loop()),
             asyncio.create_task(self._session_transition_loop()),
@@ -815,6 +846,13 @@ class SilverHedgeBot:
             if in_session and not self.ctp_gateway.is_connected:
                 issues.append("CTP 网关断开")
 
+            if (
+                RUNTIME.hl_data_mode == "remote"
+                and bool(RUNTIME.hl_remote_quote_ws_url)
+                and not self.data_engine.remote_quote_ws_connected
+            ):
+                issues.append("HL远端行情WS断开(已禁止开新仓)")
+
             # HL/AG 数据新鲜度
             latest = self.data_engine.latest
             if latest:
@@ -843,6 +881,149 @@ class SilverHedgeBot:
                     await self.notifier.notify_emergency(msg)
 
             await asyncio.sleep(60)
+
+    async def _position_reconcile_loop(self):
+        """Periodically reconcile local/CTP/HL legs and alert when asymmetry is detected."""
+        while self._running:
+            try:
+                msg = await self._build_position_mismatch_message()
+                if msg:
+                    logger.warning(msg)
+                    if msg != self._last_position_mismatch_msg or self._should_send_alert(
+                        "position_mismatch",
+                        max(30, int(RISK.position_mismatch_alert_cooldown_sec)),
+                    ):
+                        await self.margin_notifier.notify_error(msg, "SILVER")
+                    self._last_position_mismatch_msg = msg
+                else:
+                    self._last_position_mismatch_msg = ""
+            except Exception as e:
+                logger.warning(f"仓位对账异常: {e}")
+
+            await asyncio.sleep(max(10, int(RISK.position_reconcile_interval_sec)))
+
+    async def _build_position_mismatch_message(self) -> str:
+        pair = TRADING_PAIRS["SILVER"]
+        ctp_side, ctp_lots = await self._get_ctp_position_side_lots(pair.ctp_instrument)
+        hl_side, hl_lots = await self._get_hl_position_side_lots(pair.hl_symbol, pair.ctp_multiplier)
+
+        local_side = self.signal_engine.position
+        local_lots = float(self.position_manager.current_lots)
+
+        has_any_leg = (
+            local_side != "NONE"
+            or ctp_side != "NONE"
+            or hl_side != "NONE"
+            or local_lots > 0
+            or ctp_lots > 0
+            or hl_lots > 0
+        )
+        if not has_any_leg:
+            return ""
+
+        mismatch_reasons = []
+
+        # LONG spread: CTP LONG + HL SHORT; SHORT spread: CTP SHORT + HL LONG
+        expected_ctp_side = "NONE"
+        expected_hl_side = "NONE"
+        if local_side == "LONG":
+            expected_ctp_side = "LONG"
+            expected_hl_side = "SHORT"
+        elif local_side == "SHORT":
+            expected_ctp_side = "SHORT"
+            expected_hl_side = "LONG"
+
+        if local_side != "NONE":
+            if ctp_side != expected_ctp_side:
+                mismatch_reasons.append(f"CTP方向不一致(expected={expected_ctp_side}, got={ctp_side})")
+            if hl_side != expected_hl_side:
+                mismatch_reasons.append(f"HL方向不一致(expected={expected_hl_side}, got={hl_side})")
+            if ctp_lots > 0 and abs(ctp_lots - local_lots) > 0.35:
+                mismatch_reasons.append(
+                    f"CTP手数不一致(local={local_lots:.2f}, ctp={ctp_lots:.2f})"
+                )
+            if hl_lots > 0 and abs(hl_lots - local_lots) > 0.35:
+                mismatch_reasons.append(
+                    f"HL手数不一致(local={local_lots:.2f}, hl={hl_lots:.2f})"
+                )
+        else:
+            # Local says flat, but any leg still has exposure.
+            if ctp_side != "NONE" or hl_side != "NONE":
+                mismatch_reasons.append("本地状态为平仓，但外部仍有持仓")
+
+        # Independent hedge-leg symmetry check.
+        if (ctp_side != "NONE") != (hl_side != "NONE"):
+            mismatch_reasons.append("单边暴露: 仅一侧有持仓")
+        elif ctp_side != "NONE" and hl_side != "NONE":
+            if ctp_side == hl_side:
+                mismatch_reasons.append("对冲方向异常: CTP与HL同向")
+            if abs(ctp_lots - hl_lots) > 0.35:
+                mismatch_reasons.append(f"双腿手数不对等(ctp={ctp_lots:.2f}, hl={hl_lots:.2f})")
+
+        if not mismatch_reasons:
+            return ""
+
+        return (
+            "仓位不对等告警: "
+            + "; ".join(mismatch_reasons)
+            + f" | local={local_side}/{local_lots:.2f} "
+            + f"ctp={ctp_side}/{ctp_lots:.2f} hl={hl_side}/{hl_lots:.2f}"
+        )
+
+    async def _get_ctp_position_side_lots(self, instrument_id: str) -> tuple[str, float]:
+        if not self.ctp_gateway.is_connected:
+            return ("NONE", 0.0)
+
+        positions = await self.ctp_gateway.query_positions(instrument_id=instrument_id)
+        long_lots = 0.0
+        short_lots = 0.0
+        for pos in positions:
+            if pos.instrument_id != instrument_id:
+                continue
+            if pos.direction == "LONG":
+                long_lots += float(pos.volume)
+            elif pos.direction == "SHORT":
+                short_lots += float(pos.volume)
+
+        net = long_lots - short_lots
+        if abs(net) < 1e-6:
+            return ("NONE", 0.0)
+        return ("LONG", net) if net > 0 else ("SHORT", abs(net))
+
+    async def _get_hl_position_side_lots(self, hl_symbol: str, ctp_multiplier: int) -> tuple[str, float]:
+        if not API.hl_wallet_address:
+            return ("NONE", 0.0)
+
+        state = await self.hl_client.get_user_state()
+        if not isinstance(state, dict):
+            return ("NONE", 0.0)
+
+        symbol_variants = {hl_symbol}
+        if API.hl_dex:
+            symbol_variants.add(f"{API.hl_dex}:{hl_symbol}")
+
+        net_size_oz = 0.0
+        for entry in state.get("assetPositions", []) or []:
+            pos = entry.get("position", entry) if isinstance(entry, dict) else {}
+            coin = str(pos.get("coin") or pos.get("symbol") or pos.get("asset") or "").strip()
+            if coin not in symbol_variants:
+                continue
+            raw_size = pos.get("szi")
+            if raw_size is None:
+                raw_size = pos.get("sz")
+            if raw_size is None:
+                raw_size = pos.get("size")
+            if raw_size is None:
+                raw_size = pos.get("position")
+            try:
+                net_size_oz += float(raw_size)
+            except Exception:
+                continue
+
+        lots = abs(net_size_oz) * 0.0311035 / float(ctp_multiplier)
+        if abs(net_size_oz) < 1e-8:
+            return ("NONE", 0.0)
+        return ("LONG", lots) if net_size_oz > 0 else ("SHORT", lots)
 
     async def _md_watchdog_loop(self):
         """During trading sessions, reconnect CTP if AG ticks stop updating for too long."""

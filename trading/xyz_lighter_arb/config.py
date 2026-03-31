@@ -51,7 +51,7 @@ TRADING_PAIRS: Dict[str, TradingPair] = {
 @dataclass
 class StrategyConfig:
     # 入场/出场阈值 (来自 spread_backtest_1m.py 最优参数扫描)
-    entry_zscore: float = 2.4       # Z-score入场阈值 (提高阈值, 减少低优势交易)
+    entry_zscore: float = 2.3       # Z-score入场阈值 (轻微放宽)
     exit_zscore: float = 0.8        # Z-score出场阈值
     stop_loss_zscore: float = 4.0   # 止损阈值
 
@@ -321,6 +321,10 @@ class RiskConfig:
     md_watchdog_no_tick_sec: int = 60  # 开盘时段内 AG 超过该秒数无新 tick 则触发 watchdog
     md_watchdog_alert_cooldown_sec: int = 600  # watchdog 同类告警发送冷却 (秒)
     disconnect_ctp_when_closed: bool = True  # 非交易时段自动断开 CTP
+
+    position_reconcile_interval_sec: int = 60
+    position_mismatch_alert_cooldown_sec: int = 60
+    hl_quote_ws_down_alert_cooldown_sec: int = 60
 
 RISK = RiskConfig()
 
