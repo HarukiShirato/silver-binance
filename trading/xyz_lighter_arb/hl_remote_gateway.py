@@ -4,11 +4,13 @@
 import json
 import os
 import time
+import asyncio
 import threading
 import urllib.parse
 import urllib.request
 from typing import Optional, Dict, Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import websockets
 
 LOG_DIR = "logs"
 EVENT_LOG = os.path.join(LOG_DIR, "hl_gateway_events.jsonl")
@@ -19,6 +21,9 @@ HL_DEX = os.environ.get("HL_DEX", "xyz").strip()
 DEFAULT_SYMBOL = os.environ.get("HL_QUOTE_SYMBOL", "SILVER").strip() or "SILVER"
 QUOTE_POLL_SEC = max(0.2, float(os.environ.get("HL_QUOTE_POLL_SEC", "0.5")))
 QUOTE_STALE_SEC = max(1.0, float(os.environ.get("HL_QUOTE_STALE_SEC", "5")))
+QUOTE_WS_HOST = os.environ.get("HL_QUOTE_WS_HOST", "0.0.0.0").strip() or "0.0.0.0"
+QUOTE_WS_PORT = int(os.environ.get("HL_QUOTE_WS_PORT", "18081"))
+QUOTE_WS_PUSH_SEC = max(0.05, float(os.environ.get("HL_QUOTE_WS_PUSH_SEC", "0.2")))
 
 _quote_lock = threading.Lock()
 _quote_state: Dict[str, Any] = {
@@ -121,6 +126,33 @@ def _get_quote(symbol: str) -> Dict[str, Any]:
     }
 
 
+async def _quote_ws_handler(ws):
+    """Push latest quote to websocket clients."""
+    try:
+        path = getattr(ws, "path", "") or ""
+        parsed = urllib.parse.urlparse(path)
+        query = urllib.parse.parse_qs(parsed.query or "")
+        symbol = (query.get("symbol") or [DEFAULT_SYMBOL])[0]
+        client = ws.remote_address
+        print(f"[HL-GW] quote ws connected from {client} symbol={symbol}")
+        while True:
+            quote = _get_quote(symbol)
+            await ws.send(json.dumps(quote, ensure_ascii=False))
+            await asyncio.sleep(QUOTE_WS_PUSH_SEC)
+    except Exception:
+        pass
+
+
+async def _run_ws_server():
+    async with websockets.serve(_quote_ws_handler, QUOTE_WS_HOST, QUOTE_WS_PORT, ping_interval=15, ping_timeout=10):
+        print(f"[HL-GW] quote websocket listening on {QUOTE_WS_HOST}:{QUOTE_WS_PORT}")
+        await asyncio.Future()
+
+
+def _quote_ws_thread():
+    asyncio.run(_run_ws_server())
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "HLRemoteGateway/0.1"
 
@@ -137,7 +169,15 @@ class Handler(BaseHTTPRequestHandler):
                     "path": self.path,
                 }
             )
-            self._send(200, {"ok": True, "ts": time.time()})
+            ws_scheme = "ws"
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "ts": time.time(),
+                    "quote_ws_url": f"{ws_scheme}://{self.headers.get('Host', '').split(':')[0] or '127.0.0.1'}:{QUOTE_WS_PORT}/quote",
+                },
+            )
             return
 
         parsed = urllib.parse.urlparse(self.path)
@@ -234,10 +274,12 @@ def main():
     port = 18080
     updater = threading.Thread(target=_quote_updater, daemon=True)
     updater.start()
+    ws_thread = threading.Thread(target=_quote_ws_thread, daemon=True)
+    ws_thread.start()
     server = ThreadingHTTPServer((host, port), Handler)
     print(
         f"HL remote gateway listening on {host}:{port} "
-        f"(quote_symbol={_normalize_symbol(DEFAULT_SYMBOL)}, poll={QUOTE_POLL_SEC}s)"
+        f"(quote_symbol={_normalize_symbol(DEFAULT_SYMBOL)}, poll={QUOTE_POLL_SEC}s, ws_port={QUOTE_WS_PORT})"
     )
     server.serve_forever()
 

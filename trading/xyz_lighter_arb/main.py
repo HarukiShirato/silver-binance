@@ -87,6 +87,7 @@ class SilverHedgeBot:
             pair=pair,
             hl_data_mode=RUNTIME.hl_data_mode,
             remote_quote_url=RUNTIME.hl_remote_quote_url,
+            remote_quote_ws_url=RUNTIME.hl_remote_quote_ws_url,
             remote_quote_timeout_sec=RUNTIME.remote_quote_timeout_sec,
             remote_quote_poll_sec=RUNTIME.remote_quote_poll_sec,
         )
@@ -244,6 +245,7 @@ class SilverHedgeBot:
             f"hl_remote_url={RUNTIME.hl_remote_url or 'N/A'} "
             f"hl_data_mode={RUNTIME.hl_data_mode} "
             f"hl_remote_quote_url={RUNTIME.hl_remote_quote_url or 'N/A'} "
+            f"hl_remote_quote_ws_url={RUNTIME.hl_remote_quote_ws_url or 'N/A'} "
             f"entry_z={STRATEGY.entry_zscore} exit_z={STRATEGY.exit_zscore} stop_z={STRATEGY.stop_loss_zscore} "
             f"window={STRATEGY.spread_window} sample_interval={STRATEGY.sample_interval}s "
             f"max_lots={STRATEGY.max_position_lots} emergency_spread_pct={RISK.emergency_spread_pct} "
