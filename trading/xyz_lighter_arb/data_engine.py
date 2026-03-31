@@ -60,6 +60,7 @@ class DataEngine:
         pair: TradingPair,
         hl_data_mode: str = "local",
         remote_quote_url: str = "",
+        remote_quote_ws_url: str = "",
         remote_quote_timeout_sec: float = 1.0,
         remote_quote_poll_sec: float = 1.0,
     ):
@@ -70,6 +71,7 @@ class DataEngine:
         self._pair = pair
         self._hl_data_mode = (hl_data_mode or "local").strip().lower()
         self._remote_quote_url = (remote_quote_url or "").strip()
+        self._remote_quote_ws_url = (remote_quote_ws_url or "").strip()
         self._remote_quote_timeout_sec = max(0.2, float(remote_quote_timeout_sec))
         self._remote_quote_poll_sec = max(0.2, float(remote_quote_poll_sec))
 
@@ -120,14 +122,22 @@ class DataEngine:
 
         # 2. HL: 启动远程行情拉取或本地 WebSocket
         if self._hl_data_mode == "remote":
-            if not self._remote_quote_url:
-                raise ValueError("HL_DATA_MODE=remote but HL_REMOTE_QUOTE_URL is empty")
-            asyncio.create_task(self._run_hl_remote_quote())
-            logger.info(
-                "HL data source: remote quote "
-                f"url={self._remote_quote_url} "
-                f"poll={self._remote_quote_poll_sec:.2f}s timeout={self._remote_quote_timeout_sec:.2f}s"
-            )
+            if self._remote_quote_ws_url:
+                asyncio.create_task(self._run_hl_remote_quote_ws())
+                logger.info(
+                    "HL data source: remote quote websocket "
+                    f"url={self._remote_quote_ws_url} "
+                    f"fallback_http={self._remote_quote_url or 'N/A'}"
+                )
+            else:
+                if not self._remote_quote_url:
+                    raise ValueError("HL_DATA_MODE=remote but HL_REMOTE_QUOTE_URL is empty")
+                asyncio.create_task(self._run_hl_remote_quote())
+                logger.info(
+                    "HL data source: remote quote http polling "
+                    f"url={self._remote_quote_url} "
+                    f"poll={self._remote_quote_poll_sec:.2f}s timeout={self._remote_quote_timeout_sec:.2f}s"
+                )
         else:
             asyncio.create_task(self._run_hl_ws())
             logger.info("HL data source: local websocket")
@@ -193,6 +203,59 @@ class DataEngine:
             except Exception as e:
                 if self._running:
                     logger.error(f"HL WebSocket 错误: {e}, {backoff}s 后重连")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+
+    async def _run_hl_remote_quote_ws(self):
+        """Consume remote quote websocket stream from Tokyo, fallback to HTTP polling."""
+        if not self._remote_quote_ws_url:
+            await self._run_hl_remote_quote()
+            return
+
+        backoff = 1.0
+        max_backoff = 10.0
+        hl_symbol = self._pair.hl_symbol
+        while self._running:
+            try:
+                stream_url = self._remote_quote_ws_url
+                if "?" in stream_url:
+                    stream_url = f"{stream_url}&symbol={hl_symbol}"
+                else:
+                    stream_url = f"{stream_url}?symbol={hl_symbol}"
+
+                async with websockets.connect(stream_url, ping_interval=15, ping_timeout=10) as ws:
+                    logger.info(f"HL remote quote websocket connected: {self._remote_quote_ws_url}")
+                    backoff = 1.0
+                    async for message in ws:
+                        if not self._running:
+                            break
+                        data = json.loads(message)
+                        if not isinstance(data, dict):
+                            continue
+                        if not data.get("ok", False):
+                            logger.warning(f"HL remote quote ws not ok: {data}")
+                            continue
+
+                        price = float(data.get("price", 0) or 0)
+                        if price <= 0:
+                            continue
+
+                        src_ts = data.get("ts")
+                        if isinstance(src_ts, (int, float)) and src_ts > 0:
+                            self._hl_update_time = float(src_ts)
+                        else:
+                            self._hl_update_time = time.time()
+                        self._hl_mid = price
+                        await self._emit_price()
+            except Exception as e:
+                if self._running:
+                    logger.warning(f"HL remote quote websocket error: {e}")
+                    if self._remote_quote_url:
+                        logger.info("HL remote quote websocket fallback to HTTP polling")
+                        try:
+                            await self._run_hl_remote_quote()
+                        except Exception as poll_e:
+                            logger.warning(f"HL remote quote fallback polling error: {poll_e}")
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, max_backoff)
 
