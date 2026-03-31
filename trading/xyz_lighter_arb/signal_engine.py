@@ -206,29 +206,23 @@ class SignalEngine:
 
     def _generate_signal(self, zscore: float) -> Signal:
         if self._position == "LONG" and zscore < -self._stop_z:
-            self._position = "NONE"
             return Signal.EXIT_LONG
 
         if self._position == "SHORT" and zscore > self._stop_z:
-            self._position = "NONE"
             return Signal.EXIT_SHORT
 
         if self._position == "LONG" and zscore >= -self._exit_z:
-            self._position = "NONE"
             return Signal.EXIT_LONG
 
         if self._position == "SHORT" and zscore <= self._exit_z:
-            self._position = "NONE"
             return Signal.EXIT_SHORT
 
         if self._position == "NONE":
             if self._session_mgr and self._session_mgr.is_near_boundary():
                 return Signal.HOLD
             if zscore < -self._entry_z:
-                self._position = "LONG"
                 return Signal.LONG
             if zscore > self._entry_z:
-                self._position = "SHORT"
                 return Signal.SHORT
 
         return Signal.HOLD
