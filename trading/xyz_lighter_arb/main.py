@@ -316,7 +316,12 @@ class SilverHedgeBot:
                 return
             logger.info("非交易时段，自动断开 CTP")
             self.data_engine.deactivate_ctp_stream()
-            await self.ctp_gateway.close()
+            try:
+                await asyncio.wait_for(self.ctp_gateway.close(), timeout=15)
+            except asyncio.TimeoutError:
+                logger.warning("非交易时段断开CTP超时(15s)，继续后续流程")
+            except Exception as e:
+                logger.warning(f"非交易时段断开CTP异常(忽略): {e}")
             self._ctp_paused_by_session = True
             self._ctp_connected_at = 0.0
 
@@ -324,7 +329,9 @@ class SilverHedgeBot:
         async with self._ctp_reconnect_lock:
             logger.warning(f"触发 CTP 重连: reason={reason}")
             try:
-                await self.ctp_gateway.close()
+                await asyncio.wait_for(self.ctp_gateway.close(), timeout=15)
+            except asyncio.TimeoutError:
+                logger.warning("CTP重连前关闭超时(15s)，继续重连")
             except Exception as e:
                 logger.warning(f"CTP 关闭异常(忽略): {e}")
             await self._connect_ctp_with_fallback()
@@ -1069,6 +1076,8 @@ class SilverHedgeBot:
         await self.data_engine.stop()
         await self.ctp_gateway.close()
         await self.hl_client.close()
+        if self.remote_hl_executor is not None:
+            self.remote_hl_executor.close()
         await self.notifier.close()
         await self.margin_notifier.close()
 
