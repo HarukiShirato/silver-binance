@@ -159,6 +159,9 @@ class SilverHedgeBot:
         self._ctp_connected_at: float = 0.0
         self._ctp_paused_by_session = False
         self._last_position_mismatch_msg = ""
+        self._position_phase = "NONE"  # NONE | PENDING_ENTRY_* | PENDING_EXIT_*
+        self._pending_signal_id = ""
+        self._pending_since = 0.0
 
     async def initialize(self):
         """Initialize exchanges and data sources."""
@@ -206,18 +209,8 @@ class SilverHedgeBot:
         # 鍔犺浇椋庢帶鐘舵€?
         self.risk_manager.load_state()
 
-        # 鎭㈠浠撲綅鐘舵€?(宕╂簝鎭㈠)
-        saved_pos = self.risk_manager.get_position_state('SILVER')
-        if saved_pos:
-            direction = saved_pos.get("direction", "NONE")
-            lots = saved_pos.get("lots", 0)
-            if direction != "NONE" and lots > 0:
-                self.signal_engine.set_position(direction)
-                self.position_manager.current_lots = lots
-                logger.warning(
-                    f"恢复上次持仓: {direction} {lots} 手"
-                    f"(请确认与实际持仓一致)"
-                )
+        # 启动先做一次外部仓位对账：以外部真实仓位为准
+        await self._sync_local_position_from_external_on_startup()
 
         # 娉ㄥ唽浠锋牸鍥炶皟
         self.data_engine.on_price(self._on_price)
@@ -340,6 +333,27 @@ class SilverHedgeBot:
             await self._connect_ctp_with_fallback()
             self.data_engine.activate_ctp_stream()
 
+    async def _sync_local_position_from_external_on_startup(self):
+        truth = await self._read_external_position_truth()
+        if truth is None:
+            self.signal_engine.set_position("NONE")
+            self.position_manager.current_lots = 0
+            self.risk_manager.save_position_state("SILVER", "NONE", 0)
+            logger.info("启动对账: 外部仓位不可用，默认本地清仓态")
+            return
+
+        truth_side = truth["truth_side"]
+        truth_lots = truth["truth_lots"]
+        self.signal_engine.set_position(truth_side)
+        self.position_manager.current_lots = int(round(truth_lots))
+        self.risk_manager.save_position_state("SILVER", truth_side, self.position_manager.current_lots)
+        logger.info(
+            "启动对账完成: "
+            f"truth={truth_side}/{truth_lots:.2f}, "
+            f"ctp={truth['ctp_side']}/{truth['ctp_lots']:.2f}, "
+            f"hl={truth['hl_side']}/{truth['hl_lots']:.2f}"
+        )
+
     async def _on_price(self, price: NormalizedPrice):
         """DataEngine callback: price -> signal -> execution."""
         result = self.signal_engine.update(price)
@@ -381,7 +395,6 @@ class SilverHedgeBot:
         )
 
     async def _process_signal(self, signal: SignalResult):
-        """Handle a trading signal."""
         signal_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{signal.signal.value}-{uuid.uuid4().hex[:8]}"
         logger.info(
             f"信号[{signal_id}]: {signal.signal.value} | "
@@ -389,8 +402,15 @@ class SilverHedgeBot:
             f"spread={signal.spread_pct:.3f}% zscore={signal.zscore:.2f}"
         )
 
-        # 远端 HL Quote WS 断开时，禁止开新仓（平仓仍允许）
         is_entry = signal.signal in (Signal.LONG, Signal.SHORT)
+        is_exit = signal.signal in (Signal.EXIT_LONG, Signal.EXIT_SHORT)
+
+        if is_entry and self._position_phase.startswith("PENDING"):
+            reason = f"pending_state:{self._position_phase}"
+            self._decision_stats["blocked_pending"] += 1
+            self._append_trade_event(signal.signal.value, 0, "blocked", 0.0, reason, signal, signal_id)
+            return
+
         if (
             is_entry
             and RUNTIME.hl_data_mode == "remote"
@@ -398,87 +418,45 @@ class SilverHedgeBot:
             and not self.data_engine.remote_quote_ws_connected
         ):
             reason = "hl_quote_ws_disconnected"
-            logger.warning(f"交易被阻止: {reason}")
             self._decision_stats[f"blocked_{reason}"] += 1
-            self._append_trade_event(
-                signal=signal.signal.value,
-                lots=0,
-                status="blocked",
-                fee_rmb=0.0,
-                reason=reason,
-                signal_data=signal,
-                signal_id=signal_id,
-            )
-            if self._should_send_alert(
-                "hl_quote_ws_disconnected",
-                max(30, int(RISK.hl_quote_ws_down_alert_cooldown_sec)),
-            ):
+            self._append_trade_event(signal.signal.value, 0, "blocked", 0.0, reason, signal, signal_id)
+            if self._should_send_alert("hl_quote_ws_disconnected", max(30, int(RISK.hl_quote_ws_down_alert_cooldown_sec))):
                 await self.margin_notifier.notify_error(
                     f"阻止开新仓: HL quote websocket 断开, last_err={self.data_engine.remote_quote_ws_last_error or 'N/A'}",
                     "SILVER",
                 )
             return
 
-        # 椋庢帶妫€鏌?
         can_trade, reason = self.risk_manager.can_trade('SILVER', signal=signal.signal.value)
         if not can_trade:
-            logger.warning(f"交易被阻止: {reason}")
             self._decision_stats[f"blocked_risk_{reason}"] += 1
-            self._append_trade_event(
-                signal=signal.signal.value,
-                lots=0,
-                status="blocked",
-                fee_rmb=0.0,
-                reason=f"risk:{reason}",
-                signal_data=signal,
-                signal_id=signal_id,
-            )
+            self._append_trade_event(signal.signal.value, 0, "blocked", 0.0, f"risk:{reason}", signal, signal_id)
             return
 
-        # 浠峰樊瀹夊叏妫€鏌?
-        safe, reason = self.risk_manager.check_spread_safety(
-            signal.ag_price, signal.hl_price_cny_kg
-        )
+        safe, reason = self.risk_manager.check_spread_safety(signal.ag_price, signal.hl_price_cny_kg)
         if not safe:
             await self.notifier.notify_emergency(reason)
             self._decision_stats[f"blocked_spread_{reason}"] += 1
-            self._append_trade_event(
-                signal=signal.signal.value,
-                lots=0,
-                status="blocked",
-                fee_rmb=0.0,
-                reason=f"spread:{reason}",
-                signal_data=signal,
-                signal_id=signal_id,
-            )
+            self._append_trade_event(signal.signal.value, 0, "blocked", 0.0, f"spread:{reason}", signal, signal_id)
             return
 
-        # 璁＄畻鎵嬫暟
         if is_entry:
             lots = self.position_manager.calculate_order_lots(
                 ag_price_cny_kg=signal.ag_price,
                 hl_price_usd_oz=signal.hl_price_usd_oz,
                 usdcny=signal.usdcny,
             )
-        else:
-            # 骞充粨: 骞冲叏閮ㄦ寔浠?
+        elif is_exit:
             lots = self.position_manager.current_lots
+        else:
+            lots = 0
 
         if lots <= 0:
-            logger.warning("计算手数为 0，跳过")
             self._decision_stats["blocked_lots_zero"] += 1
-            self._append_trade_event(
-                signal=signal.signal.value,
-                lots=0,
-                status="blocked",
-                fee_rmb=0.0,
-                reason="lots_zero",
-                signal_data=signal,
-                signal_id=signal_id,
-            )
+            self._append_trade_event(signal.signal.value, 0, "blocked", 0.0, "lots_zero", signal, signal_id)
             return
 
-        # 璁板綍浜ゆ槗寮€濮?
+        self._set_pending_phase(signal.signal.value, signal_id)
         self.risk_manager.record_trade_start(
             pair_name='SILVER',
             signal=signal.signal.value,
@@ -488,7 +466,6 @@ class SilverHedgeBot:
             zscore=signal.zscore,
         )
 
-        # 鎺ㄩ€佷氦鏄撲俊鍙?
         if NOTIFY.notify_on_trade:
             await self.notifier.notify_trade(
                 pair_name='SILVER',
@@ -500,16 +477,11 @@ class SilverHedgeBot:
                 spread=signal.spread_pct,
             )
 
-        # 鎵ц浜ゆ槗
         if RUNTIME.dry_run:
-            if is_entry:
-                self.position_manager.on_open(lots)
-            else:
-                self.position_manager.on_close(lots)
-                self.signal_engine.reset_funding()
-
+            remote_ok = True
+            remote_error = ""
             if self.remote_hl_executor is not None:
-                remote_payload = {
+                payload = {
                     "signal_id": signal_id,
                     "signal": signal.signal.value,
                     "symbol": TRADING_PAIRS['SILVER'].hl_symbol,
@@ -522,96 +494,59 @@ class SilverHedgeBot:
                     "zscore": signal.zscore,
                     "ts": signal.timestamp,
                 }
-                remote_result = self.remote_hl_executor.send_dry_run(remote_payload)
-                if remote_result.ok:
+                result = self.remote_hl_executor.send_dry_run(payload)
+                if result.ok:
                     self._last_remote_ok_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self._last_remote_err = ""
-                    logger.info(
-                        f"远程HL执行回执 OK: signal_id={signal_id} code={remote_result.status_code} latency={remote_result.latency_ms:.1f}ms"
-                    )
                 else:
-                    self._last_remote_err = f"code={remote_result.status_code} detail={remote_result.detail}"
-                    logger.warning(
-                        f"远程HL执行回执失败: signal_id={signal_id} code={remote_result.status_code} latency={remote_result.latency_ms:.1f}ms detail={remote_result.detail}"
-                    )
+                    remote_ok = False
+                    remote_error = f"code={result.status_code} detail={result.detail}"
+                    self._last_remote_err = remote_error
 
-            self.risk_manager.save_position_state(
-                pair_name='SILVER',
-                direction=self.signal_engine.position,
-                lots=self.position_manager.current_lots,
-            )
-            self.risk_manager.record_trade_result('SILVER', 0, "filled")
-            if NOTIFY.notify_on_trade:
-                await self.notifier.notify_trade_result(
-                    pair_name='SILVER',
-                    signal=f"DRY_RUN_{signal.signal.value}",
-                    xyz_fill_price=signal.ag_price,
-                    lighter_fill_price=signal.hl_price_usd_oz,
-                    size=lots,
-                    fees=0,
-                    status="filled",
-                )
-                await self.notifier.notify_dry_run_fill(
-                    signal=signal.signal.value,
-                    lots=lots,
-                    zscore=signal.zscore,
-                    spread_pct=signal.spread_pct,
-                    ag_price=signal.ag_price,
-                    hl_price_usd=signal.hl_price_usd_oz,
-                    hl_price_cny_kg=signal.hl_price_cny_kg,
-                    usdcny=signal.usdcny,
-                    position_after=self.signal_engine.position,
-                )
-            self.risk_manager.set_cooldown(STRATEGY.cooldown_seconds)
-            self._append_trade_event(
-                signal=signal.signal.value,
-                lots=lots,
-                status="filled",
-                fee_rmb=0.0,
-                reason="dry_run_fill",
-                signal_data=signal,
-                signal_id=signal_id,
-            )
-            logger.info(
-                "DRY_RUN 成交模拟: "
-                f"signal={signal.signal.value} lots={lots} "
-                f"z={signal.zscore:.2f} spread={signal.spread_pct:.3f}% "
-                f"AG={signal.ag_price:.1f} HL=${signal.hl_price_usd_oz:.4f} "
-                f"HL_CNY={signal.hl_price_cny_kg:.1f} usdcny={signal.usdcny:.4f} "
-                f"position_after={self.signal_engine.position}"
-            )
+            if remote_ok:
+                self._apply_filled_position_state(signal.signal.value, lots)
+                self.risk_manager.save_position_state('SILVER', self.signal_engine.position, self.position_manager.current_lots)
+                self.risk_manager.record_trade_result('SILVER', 0, "filled")
+                if NOTIFY.notify_on_trade:
+                    await self.notifier.notify_trade_result(
+                        pair_name='SILVER',
+                        signal=f"DRY_RUN_{signal.signal.value}",
+                        xyz_fill_price=signal.ag_price,
+                        lighter_fill_price=signal.hl_price_usd_oz,
+                        size=lots,
+                        fees=0,
+                        status="filled",
+                    )
+                    await self.notifier.notify_dry_run_fill(
+                        signal=signal.signal.value,
+                        lots=lots,
+                        zscore=signal.zscore,
+                        spread_pct=signal.spread_pct,
+                        ag_price=signal.ag_price,
+                        hl_price_usd=signal.hl_price_usd_oz,
+                        hl_price_cny_kg=signal.hl_price_cny_kg,
+                        usdcny=signal.usdcny,
+                        position_after=self.signal_engine.position,
+                    )
+                self.risk_manager.set_cooldown(STRATEGY.cooldown_seconds)
+                self._append_trade_event(signal.signal.value, lots, "filled", 0.0, "dry_run_fill", signal, signal_id)
+            else:
+                self.risk_manager.record_trade_result('SILVER', 0, "failed")
+                self._decision_stats["dry_run_remote_failed"] += 1
+                self._append_trade_event(signal.signal.value, 0, "failed", 0.0, f"dry_run_remote_failed:{remote_error}", signal, signal_id)
+                if NOTIFY.notify_on_error:
+                    await self.notifier.notify_error(f"DRY_RUN 远端回执失败，忽略本次成交: {remote_error}", 'SILVER')
+            self._clear_pending_phase()
             return
 
         try:
             result = await self.execution_engine.execute(signal, lots)
-
             if result.status == "filled":
-                # 鏇存柊浠撲綅
-                if is_entry:
-                    self.position_manager.on_open(lots)
-                else:
-                    self.position_manager.on_close(lots)
-                    self.signal_engine.reset_funding()
-
-                # 鎸佷箙鍖栦粨浣嶇姸鎬?(渚涘穿婧冩仮澶?
-                self.risk_manager.save_position_state(
-                    pair_name='SILVER',
-                    direction=self.signal_engine.position,
-                    lots=self.position_manager.current_lots,
-                )
-
+                self._apply_filled_position_state(signal.signal.value, lots)
+                self.risk_manager.save_position_state('SILVER', self.signal_engine.position, self.position_manager.current_lots)
                 self.risk_manager.record_trade_result('SILVER', -result.total_fee_rmb, "filled")
                 self._total_fees_today += result.total_fee_rmb
-                self._append_trade_event(
-                    signal=signal.signal.value,
-                    lots=lots,
-                    status="filled",
-                    fee_rmb=result.total_fee_rmb,
-                    reason="live_fill",
-                    signal_data=signal,
-                    signal_id=signal_id,
-                )
-
+                self._append_trade_event(signal.signal.value, lots, "filled", result.total_fee_rmb, "live_fill", signal, signal_id)
                 if NOTIFY.notify_on_trade:
                     await self.notifier.notify_trade_result(
                         pair_name='SILVER',
@@ -626,35 +561,60 @@ class SilverHedgeBot:
                 self.risk_manager.record_trade_result('SILVER', 0, result.status)
                 self._decision_stats[f"exec_status_{result.status}"] += 1
                 self._append_trade_event(
-                    signal=signal.signal.value,
-                    lots=lots,
-                    status=result.status,
-                    fee_rmb=0.0,
-                    reason=result.error or "live_execute_not_filled",
-                    signal_data=signal,
-                    signal_id=signal_id,
+                    signal.signal.value,
+                    lots,
+                    result.status,
+                    0.0,
+                    result.error or "live_execute_not_filled",
+                    signal,
+                    signal_id,
                 )
                 if NOTIFY.notify_on_error:
                     await self.notifier.notify_error(result.error, 'SILVER')
-
-            # 鍐峰嵈鏈?
             self.risk_manager.set_cooldown(STRATEGY.cooldown_seconds)
-
+            self._clear_pending_phase()
         except Exception as e:
             logger.error(f"交易执行异常: {e}")
             self.risk_manager.record_trade_result('SILVER', 0, "failed")
             self._decision_stats["exec_exception"] += 1
-            self._append_trade_event(
-                signal=signal.signal.value,
-                lots=lots,
-                status="failed",
-                fee_rmb=0.0,
-                reason=str(e),
-                signal_data=signal,
-                signal_id=signal_id,
-            )
+            self._append_trade_event(signal.signal.value, lots, "failed", 0.0, str(e), signal, signal_id)
             if NOTIFY.notify_on_error:
                 await self.notifier.notify_error(str(e), 'SILVER')
+            self._clear_pending_phase()
+
+    def _set_pending_phase(self, signal_name: str, signal_id: str):
+        if signal_name == "LONG":
+            self._position_phase = "PENDING_ENTRY_LONG"
+        elif signal_name == "SHORT":
+            self._position_phase = "PENDING_ENTRY_SHORT"
+        elif signal_name == "EXIT_LONG":
+            self._position_phase = "PENDING_EXIT_LONG"
+        elif signal_name == "EXIT_SHORT":
+            self._position_phase = "PENDING_EXIT_SHORT"
+        else:
+            self._position_phase = "NONE"
+        self._pending_signal_id = signal_id
+        self._pending_since = time.time()
+
+    def _clear_pending_phase(self):
+        self._position_phase = "NONE"
+        self._pending_signal_id = ""
+        self._pending_since = 0.0
+
+    def _apply_filled_position_state(self, signal_name: str, lots: int):
+        if signal_name == "LONG":
+            self.position_manager.on_open(lots)
+            self.signal_engine.set_position("LONG")
+            return
+        if signal_name == "SHORT":
+            self.position_manager.on_open(lots)
+            self.signal_engine.set_position("SHORT")
+            return
+        if signal_name in ("EXIT_LONG", "EXIT_SHORT"):
+            self.position_manager.on_close(lots)
+            self.signal_engine.set_position("NONE")
+            self.signal_engine.reset_funding()
+            return
 
     async def run(self):
         """Start background tasks."""
@@ -883,10 +843,14 @@ class SilverHedgeBot:
             await asyncio.sleep(60)
 
     async def _position_reconcile_loop(self):
-        """Periodically reconcile local/CTP/HL legs and alert when asymmetry is detected."""
         while self._running:
             try:
-                msg = await self._build_position_mismatch_message()
+                truth = await self._read_external_position_truth()
+                if truth is None:
+                    await asyncio.sleep(max(10, int(RISK.position_reconcile_interval_sec)))
+                    continue
+
+                msg = self._build_position_mismatch_message(truth)
                 if msg:
                     logger.warning(msg)
                     if msg != self._last_position_mismatch_msg or self._should_send_alert(
@@ -897,83 +861,107 @@ class SilverHedgeBot:
                     self._last_position_mismatch_msg = msg
                 else:
                     self._last_position_mismatch_msg = ""
+
+                if truth["exposure_reason"]:
+                    reason = f"单边暴露: {truth['exposure_reason']}"
+                    if not self.risk_manager.is_emergency:
+                        self.risk_manager.trigger_emergency_stop(reason)
+                    if self._should_send_alert("single_leg_exposure", 30):
+                        await self.notifier.notify_emergency(reason)
+                    await self._try_flatten_single_leg(truth)
+
+                if self._position_phase == "NONE":
+                    target_side = truth["truth_side"]
+                    target_lots = int(round(truth["truth_lots"]))
+                    if (
+                        self.signal_engine.position != target_side
+                        or self.position_manager.current_lots != target_lots
+                    ):
+                        logger.warning(
+                            "外部仓位修正本地状态: "
+                            f"local={self.signal_engine.position}/{self.position_manager.current_lots} "
+                            f"-> truth={target_side}/{target_lots}"
+                        )
+                        self.signal_engine.set_position(target_side)
+                        self.position_manager.current_lots = target_lots
+                        self.risk_manager.save_position_state("SILVER", target_side, target_lots)
             except Exception as e:
                 logger.warning(f"仓位对账异常: {e}")
 
             await asyncio.sleep(max(10, int(RISK.position_reconcile_interval_sec)))
 
-    async def _build_position_mismatch_message(self) -> str:
-        pair = TRADING_PAIRS["SILVER"]
-        ctp_side, ctp_lots = await self._get_ctp_position_side_lots(pair.ctp_instrument)
-        hl_side, hl_lots = await self._get_hl_position_side_lots(pair.hl_symbol, pair.ctp_multiplier)
-
+    def _build_position_mismatch_message(self, truth: dict) -> str:
         local_side = self.signal_engine.position
         local_lots = float(self.position_manager.current_lots)
 
-        has_any_leg = (
-            local_side != "NONE"
-            or ctp_side != "NONE"
-            or hl_side != "NONE"
-            or local_lots > 0
-            or ctp_lots > 0
-            or hl_lots > 0
-        )
-        if not has_any_leg:
-            return ""
+        ctp_side = truth["ctp_side"]
+        ctp_lots = truth["ctp_lots"]
+        hl_side = truth["hl_side"]
+        hl_lots = truth["hl_lots"]
+        truth_side = truth["truth_side"]
+        truth_lots = truth["truth_lots"]
 
-        mismatch_reasons = []
+        reasons = []
+        if truth["exposure_reason"]:
+            reasons.append(f"外部腿异常({truth['exposure_reason']})")
 
-        # LONG spread: CTP LONG + HL SHORT; SHORT spread: CTP SHORT + HL LONG
-        expected_ctp_side = "NONE"
-        expected_hl_side = "NONE"
-        if local_side == "LONG":
-            expected_ctp_side = "LONG"
-            expected_hl_side = "SHORT"
-        elif local_side == "SHORT":
-            expected_ctp_side = "SHORT"
-            expected_hl_side = "LONG"
+        if local_side != truth_side:
+            reasons.append(f"本地方向不一致(local={local_side}, truth={truth_side})")
+        if abs(local_lots - truth_lots) > 0.35:
+            reasons.append(f"本地手数不一致(local={local_lots:.2f}, truth={truth_lots:.2f})")
 
-        if local_side != "NONE":
-            if ctp_side != expected_ctp_side:
-                mismatch_reasons.append(f"CTP方向不一致(expected={expected_ctp_side}, got={ctp_side})")
-            if hl_side != expected_hl_side:
-                mismatch_reasons.append(f"HL方向不一致(expected={expected_hl_side}, got={hl_side})")
-            if ctp_lots > 0 and abs(ctp_lots - local_lots) > 0.35:
-                mismatch_reasons.append(
-                    f"CTP手数不一致(local={local_lots:.2f}, ctp={ctp_lots:.2f})"
-                )
-            if hl_lots > 0 and abs(hl_lots - local_lots) > 0.35:
-                mismatch_reasons.append(
-                    f"HL手数不一致(local={local_lots:.2f}, hl={hl_lots:.2f})"
-                )
-        else:
-            # Local says flat, but any leg still has exposure.
-            if ctp_side != "NONE" or hl_side != "NONE":
-                mismatch_reasons.append("本地状态为平仓，但外部仍有持仓")
-
-        # Independent hedge-leg symmetry check.
-        if (ctp_side != "NONE") != (hl_side != "NONE"):
-            mismatch_reasons.append("单边暴露: 仅一侧有持仓")
-        elif ctp_side != "NONE" and hl_side != "NONE":
-            if ctp_side == hl_side:
-                mismatch_reasons.append("对冲方向异常: CTP与HL同向")
-            if abs(ctp_lots - hl_lots) > 0.35:
-                mismatch_reasons.append(f"双腿手数不对等(ctp={ctp_lots:.2f}, hl={hl_lots:.2f})")
-
-        if not mismatch_reasons:
+        if not reasons:
             return ""
 
         return (
             "仓位不对等告警: "
-            + "; ".join(mismatch_reasons)
+            + "; ".join(reasons)
             + f" | local={local_side}/{local_lots:.2f} "
             + f"ctp={ctp_side}/{ctp_lots:.2f} hl={hl_side}/{hl_lots:.2f}"
         )
 
-    async def _get_ctp_position_side_lots(self, instrument_id: str) -> tuple[str, float]:
-        if not self.ctp_gateway.is_connected:
-            return ("NONE", 0.0)
+    async def _read_external_position_truth(self) -> dict | None:
+        pair = TRADING_PAIRS["SILVER"]
 
+        # CTP作为主腿，未连接时无法形成可靠真相源
+        if not self.ctp_gateway.is_connected:
+            return None
+
+        ctp_side, ctp_lots = await self._get_ctp_position_side_lots(pair.ctp_instrument)
+        hl_side, hl_lots = await self._get_hl_position_side_lots(pair.hl_symbol, pair.ctp_multiplier)
+
+        truth_side = "NONE"
+        truth_lots = 0.0
+        exposure_reason = ""
+
+        if ctp_side == "NONE" and hl_side == "NONE":
+            truth_side = "NONE"
+            truth_lots = 0.0
+        elif ctp_side == "NONE" and hl_side != "NONE":
+            exposure_reason = "ctp_flat_hl_exposed"
+        elif ctp_side != "NONE" and hl_side == "NONE":
+            exposure_reason = "ctp_exposed_hl_flat"
+        else:
+            if ctp_side == "LONG" and hl_side == "SHORT":
+                truth_side = "LONG"
+                truth_lots = min(ctp_lots, hl_lots)
+            elif ctp_side == "SHORT" and hl_side == "LONG":
+                truth_side = "SHORT"
+                truth_lots = min(ctp_lots, hl_lots)
+            else:
+                exposure_reason = "ctp_hl_same_direction"
+
+        return {
+            "ctp_side": ctp_side,
+            "ctp_lots": ctp_lots,
+            "hl_side": hl_side,
+            "hl_lots": hl_lots,
+            "truth_side": truth_side,
+            "truth_lots": truth_lots,
+            "exposure_reason": exposure_reason,
+        }
+
+    async def _get_ctp_position_side_lots(self, instrument_id: str) -> tuple[str, float]:
         positions = await self.ctp_gateway.query_positions(instrument_id=instrument_id)
         long_lots = 0.0
         short_lots = 0.0
@@ -1024,6 +1012,51 @@ class SilverHedgeBot:
         if abs(net_size_oz) < 1e-8:
             return ("NONE", 0.0)
         return ("LONG", lots) if net_size_oz > 0 else ("SHORT", lots)
+
+    async def _try_flatten_single_leg(self, truth: dict):
+        pair = TRADING_PAIRS["SILVER"]
+        ctp_side = truth["ctp_side"]
+        ctp_lots = truth["ctp_lots"]
+        hl_side = truth["hl_side"]
+        hl_lots = truth["hl_lots"]
+
+        if RUNTIME.dry_run:
+            logger.warning(
+                "DRY_RUN 模式仅告警，不执行单边暴露应急平仓: "
+                f"ctp={ctp_side}/{ctp_lots:.2f}, hl={hl_side}/{hl_lots:.2f}"
+            )
+            return
+
+        if ctp_side != "NONE" and hl_side == "NONE" and ctp_lots > 0:
+            close_dir = "SELL" if ctp_side == "LONG" else "BUY"
+            close_lots = max(1, int(round(ctp_lots)))
+            if self._should_send_alert("single_leg_flatten_ctp", 30):
+                logger.warning(f"单边暴露应急平仓CTP: {close_dir} CLOSE_TODAY {close_lots}手")
+            try:
+                await self.ctp_gateway.market_order(
+                    instrument_id=pair.ctp_instrument,
+                    direction=close_dir,
+                    offset="CLOSE_TODAY",
+                    volume=close_lots,
+                )
+            except Exception as e:
+                logger.error(f"单边暴露应急平仓CTP失败: {e}")
+
+        if hl_side != "NONE" and ctp_side == "NONE" and hl_lots > 0 and not RUNTIME.dry_run:
+            is_buy = hl_side == "SHORT"
+            hl_size_oz = hl_lots * pair.ctp_multiplier / 0.0311035
+            if self._should_send_alert("single_leg_flatten_hl", 30):
+                logger.warning(
+                    f"单边暴露应急平仓HL: {'BUY' if is_buy else 'SELL'} {hl_size_oz:.2f}oz"
+                )
+            try:
+                await self.hl_client.market_order(
+                    coin=f"xyz:{pair.hl_symbol}",
+                    is_buy=is_buy,
+                    size=hl_size_oz,
+                )
+            except Exception as e:
+                logger.error(f"单边暴露应急平仓HL失败: {e}")
 
     async def _md_watchdog_loop(self):
         """During trading sessions, reconnect CTP if AG ticks stop updating for too long."""
