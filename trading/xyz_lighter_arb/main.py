@@ -288,9 +288,21 @@ class SilverHedgeBot:
 
     async def _ensure_ctp_online_for_session(self):
         if self.ctp_gateway.is_connected:
+            if self._ctp_paused_by_session:
+                logger.info("交易时段开始，恢复 CTP 行情订阅")
+            self.data_engine.activate_ctp_stream()
+            self._ctp_paused_by_session = False
+            if self._ctp_connected_at <= 0:
+                self._ctp_connected_at = time.time()
             return
         async with self._ctp_reconnect_lock:
             if self.ctp_gateway.is_connected:
+                if self._ctp_paused_by_session:
+                    logger.info("交易时段开始，恢复 CTP 行情订阅")
+                self.data_engine.activate_ctp_stream()
+                self._ctp_paused_by_session = False
+                if self._ctp_connected_at <= 0:
+                    self._ctp_connected_at = time.time()
                 return
             logger.info("交易时段开始，自动连接 CTP")
             await self._connect_ctp_with_fallback()
@@ -507,29 +519,32 @@ class SilverHedgeBot:
                 self._apply_filled_position_state(signal.signal.value, lots)
                 self.risk_manager.save_position_state('SILVER', self.signal_engine.position, self.position_manager.current_lots)
                 self.risk_manager.record_trade_result('SILVER', 0, "filled")
-                if NOTIFY.notify_on_trade:
-                    await self.notifier.notify_trade_result(
-                        pair_name='SILVER',
-                        signal=f"DRY_RUN_{signal.signal.value}",
-                        xyz_fill_price=signal.ag_price,
-                        lighter_fill_price=signal.hl_price_usd_oz,
-                        size=lots,
-                        fees=0,
-                        status="filled",
-                    )
-                    await self.notifier.notify_dry_run_fill(
-                        signal=signal.signal.value,
-                        lots=lots,
-                        zscore=signal.zscore,
-                        spread_pct=signal.spread_pct,
-                        ag_price=signal.ag_price,
-                        hl_price_usd=signal.hl_price_usd_oz,
-                        hl_price_cny_kg=signal.hl_price_cny_kg,
-                        usdcny=signal.usdcny,
-                        position_after=self.signal_engine.position,
-                    )
-                self.risk_manager.set_cooldown(STRATEGY.cooldown_seconds)
                 self._append_trade_event(signal.signal.value, lots, "filled", 0.0, "dry_run_fill", signal, signal_id)
+                if NOTIFY.notify_on_trade:
+                    try:
+                        await self.notifier.notify_trade_result(
+                            pair_name='SILVER',
+                            signal=f"DRY_RUN_{signal.signal.value}",
+                            xyz_fill_price=signal.ag_price,
+                            lighter_fill_price=signal.hl_price_usd_oz,
+                            size=lots,
+                            fees=0,
+                            status="filled",
+                        )
+                        await self.notifier.notify_dry_run_fill(
+                            signal=signal.signal.value,
+                            lots=lots,
+                            zscore=signal.zscore,
+                            spread_pct=signal.spread_pct,
+                            ag_price=signal.ag_price,
+                            hl_price_usd=signal.hl_price_usd_oz,
+                            hl_price_cny_kg=signal.hl_price_cny_kg,
+                            usdcny=signal.usdcny,
+                            position_after=self.signal_engine.position,
+                        )
+                    except Exception as notify_err:
+                        logger.error(f"DRY_RUN 通知失败(不影响成交记录): {notify_err}")
+                self.risk_manager.set_cooldown(STRATEGY.cooldown_seconds)
             else:
                 self.risk_manager.record_trade_result('SILVER', 0, "failed")
                 self._decision_stats["dry_run_remote_failed"] += 1
@@ -1105,9 +1120,11 @@ class SilverHedgeBot:
                     continue
 
                 if previous == SessionType.CLOSED and current != SessionType.CLOSED:
+                    logger.info(f"检测到时段切换: {previous.value} -> {current.value}")
                     await self._ensure_ctp_online_for_session()
                     await self._notify_session_transition("START", current)
                 elif previous != SessionType.CLOSED and current == SessionType.CLOSED:
+                    logger.info(f"检测到时段切换: {previous.value} -> {current.value}")
                     await self._pause_ctp_for_closed_session()
                     await self._notify_session_transition("END", previous)
             except Exception as e:
