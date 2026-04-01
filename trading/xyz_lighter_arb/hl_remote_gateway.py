@@ -24,6 +24,7 @@ QUOTE_STALE_SEC = max(1.0, float(os.environ.get("HL_QUOTE_STALE_SEC", "5")))
 QUOTE_WS_HOST = os.environ.get("HL_QUOTE_WS_HOST", "0.0.0.0").strip() or "0.0.0.0"
 QUOTE_WS_PORT = int(os.environ.get("HL_QUOTE_WS_PORT", "18081"))
 QUOTE_WS_PUSH_SEC = max(0.05, float(os.environ.get("HL_QUOTE_WS_PUSH_SEC", "0.2")))
+SELF_HEAL_RESTART_SEC = max(30.0, float(os.environ.get("HL_SELF_HEAL_RESTART_SEC", "180")))
 
 _quote_lock = threading.Lock()
 _quote_state: Dict[str, Any] = {
@@ -68,6 +69,7 @@ def _fetch_all_mids() -> Dict[str, Any]:
 
 def _quote_updater():
     symbol = _normalize_symbol(DEFAULT_SYMBOL)
+    fail_since: Optional[float] = None
     while True:
         try:
             mids = _fetch_all_mids()
@@ -87,11 +89,32 @@ def _quote_updater():
                         "error": "",
                     }
                 )
+            fail_since = None
         except Exception as e:
+            now = time.time()
+            if fail_since is None:
+                fail_since = now
+            bad_for = now - fail_since
             with _quote_lock:
                 _quote_state["ok"] = False
                 _quote_state["error"] = str(e)
-            _append_event({"event": "quote_update_error", "error": str(e)})
+            _append_event({"event": "quote_update_error", "error": str(e), "bad_for_sec": round(bad_for, 3)})
+            if bad_for >= SELF_HEAL_RESTART_SEC:
+                msg = (
+                    f"[HL-GW] self-heal restart: quote updater unhealthy for {bad_for:.1f}s "
+                    f"(threshold={SELF_HEAL_RESTART_SEC:.1f}s), last_error={e}"
+                )
+                print(msg)
+                _append_event(
+                    {
+                        "event": "self_heal_restart",
+                        "reason": "quote_updater_unhealthy",
+                        "bad_for_sec": round(bad_for, 3),
+                        "threshold_sec": SELF_HEAL_RESTART_SEC,
+                        "last_error": str(e),
+                    }
+                )
+                os._exit(17)
         time.sleep(QUOTE_POLL_SEC)
 
 

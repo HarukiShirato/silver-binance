@@ -384,3 +384,30 @@ class FeishuNotifier:
             "最近30m决策统计": str(decision_stats or {}),
         }
         await self.send_card(title, fields, "blue")
+
+    async def notify_dry_run_fill(
+        self,
+        signal: str,
+        lots: float,
+        zscore: float,
+        spread_pct: float,
+        ag_price: float,
+        hl_price_usd: float,
+        hl_price_cny_kg: float,
+        usdcny: float,
+        position_after: str,
+    ):
+        """DRY_RUN 鎴愪氦閫氱煡"""
+        title = "🧪 DRY_RUN 成交"
+        fields = {
+            "信号": signal,
+            "手数": f"{lots:.4f}",
+            "Z-score": f"{zscore:.2f}",
+            "价差": f"{spread_pct:.3f}%",
+            "AG价格": f"¥{ag_price:.1f}/kg",
+            "HL价格(USD)": f"${hl_price_usd:.4f}/oz",
+            "HL价格(CNY)": f"¥{hl_price_cny_kg:.1f}/kg",
+            "USD/CNY": f"{usdcny:.4f}",
+            "持仓(执行后)": position_after,
+        }
+        await self.send_card(title, fields, "blue")
