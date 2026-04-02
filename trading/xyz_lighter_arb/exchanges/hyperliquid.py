@@ -164,12 +164,21 @@ class HyperliquidClient:
         size: float,
         price: float,
         order_type: str = "Limit",  # Limit, Market
+        tif: str = "Gtc",           # Gtc, Ioc, Alo (for Limit)
         reduce_only: bool = False,
         client_oid: Optional[str] = None,
     ) -> Dict:
         """下单"""
         await self._ensure_asset_ids()
         nonce = int(time.time() * 1000)
+
+        tif_raw = (tif or "Gtc").strip().lower()
+        tif_map = {
+            "gtc": "Gtc",
+            "ioc": "Ioc",
+            "alo": "Alo",
+        }
+        tif_value = tif_map.get(tif_raw, "Gtc")
 
         # 构建订单
         order = {
@@ -178,7 +187,7 @@ class HyperliquidClient:
             "p": str(price),
             "s": str(size),
             "r": reduce_only,
-            "t": {"limit": {"tif": "Gtc"}} if order_type == "Limit" else {"market": {}},
+            "t": {"limit": {"tif": tif_value}} if order_type == "Limit" else {"market": {}},
         }
 
         if client_oid:
@@ -257,6 +266,7 @@ class HyperliquidClient:
             size=size,
             price=round(price, 4),
             order_type="Limit",  # 用限价单模拟市价单
+            tif="Ioc",
         )
 
     async def _ensure_asset_ids(self):

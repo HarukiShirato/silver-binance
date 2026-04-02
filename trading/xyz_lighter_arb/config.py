@@ -69,6 +69,10 @@ class StrategyConfig:
     # 滑点保护
     max_slippage_pct: float = 0.1   # 最大允许滑点 0.1%
     hl_order_slippage_pct: float = 0.003  # HL 下单价格滑点保护 0.3%
+    hl_order_tif: str = "IOC"  # HL 限价单 TIF: IOC | GTC | ALO
+    # 手续费参数（单边）
+    ag_fee_rate: float = 0.00005    # SHFE AG 手续费 万5
+    hl_fee_rate: float = 0.000073   # HL taker 手续费 0.0073%
 
 STRATEGY = StrategyConfig()
 
@@ -318,8 +322,6 @@ class RiskConfig:
     margin_danger_pct: float = 0.85    # 85% 危险 (禁止加仓)
     margin_critical_pct: float = 0.90  # 90% 临界 (禁止开仓)
     margin_check_interval: int = 30    # 保证金检查间隔 (秒)
-    md_watchdog_no_tick_sec: int = 60  # 开盘时段内 AG 超过该秒数无新 tick 则触发 watchdog
-    md_watchdog_alert_cooldown_sec: int = 600  # watchdog 同类告警发送冷却 (秒)
     disconnect_ctp_when_closed: bool = True  # 非交易时段自动断开 CTP
 
     position_reconcile_interval_sec: int = 60

@@ -309,6 +309,7 @@ class FeishuNotifier:
         self,
         event: str,
         session_type: str,
+        ctp_connected: bool = None,
         ag_price: float = None,
         hl_price_usd: float = None,
         hl_price_cny_kg: float = None,
@@ -322,6 +323,10 @@ class FeishuNotifier:
         fields = {
             "事件": "START" if is_start else "END",
             "时段": session_type,
+            "CTP连接": (
+                "OK" if ctp_connected is True
+                else ("DOWN" if ctp_connected is False else "N/A")
+            ),
             "AG价格": f"{ag_price:.1f} CNY/kg" if ag_price is not None else "N/A",
             "HL价格(USD)": f"{hl_price_usd:.4f} USD/oz" if hl_price_usd is not None else "N/A",
             "HL价格(CNY)": f"{hl_price_cny_kg:.1f} CNY/kg" if hl_price_cny_kg is not None else "N/A",

@@ -1,7 +1,4 @@
-# execution_engine.py - Layer 3: 执行引擎
-#
-# 双腿并发下单: CTP AG + HL SILVER
-# 处理: 开平仓语义, 整手约束, 腿失败应急平仓
+﻿# execution_engine.py - Layer 3 dual-leg execution
 
 import asyncio
 import csv
@@ -14,9 +11,7 @@ from typing import Optional, Tuple
 from exchanges.ctp_gateway import CTPGateway, OrderResult as CTPOrderResult
 from exchanges.hyperliquid import HyperliquidClient
 from signal_engine import Signal, SignalResult
-from unit_converter import (
-    ag_lots_to_hl_oz, calculate_ag_fee, calculate_hl_fee,
-)
+from unit_converter import ag_lots_to_hl_oz, calculate_ag_fee, calculate_hl_fee
 from config import TradingPair, STRATEGY
 from notifier import FeishuNotifier
 
@@ -26,28 +21,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DualLegResult:
-    """双腿交易结果"""
-    # CTP 侧
     ag_order: Optional[CTPOrderResult] = None
     ag_fill_price: float = 0
-    # HL 侧
     hl_order: Optional[dict] = None
     hl_fill_price: float = 0
-    # 数量
     lots: int = 0
     hl_size_oz: float = 0
-    # 费用
     ag_fee_rmb: float = 0
     hl_fee_usd: float = 0
     total_fee_rmb: float = 0
-    # 状态
-    status: str = "pending"  # filled, partial, leg_failure, timeout, error
+    status: str = "pending"  # filled, rolled_back, leg_failure, timeout, error
     error: str = ""
+    exposure_unresolved: bool = False
 
 
 class ExecutionEngine:
-    """执行引擎: 双腿并发下单"""
-
     def __init__(
         self,
         ctp_gateway: CTPGateway,
@@ -61,236 +49,222 @@ class ExecutionEngine:
         self._pair = pair
         self._notifier = notifier
         self._timeout = leg_timeout_sec
+        self._ctp_wait_repair_sec = 60
+        self._hl_repair_timeout_sec = 60
+        self._hl_repair_interval_sec = 1.0
         self._audit_dir = "logs"
         os.makedirs(self._audit_dir, exist_ok=True)
 
     async def execute(self, signal: SignalResult, lots: int) -> DualLegResult:
-        """
-        执行双腿套利交易
-
-        LONG  → CTP BUY OPEN  + HL SELL
-        SHORT → CTP SELL OPEN + HL BUY
-        EXIT_LONG  → CTP SELL CLOSE_TODAY + HL BUY (reduce_only)
-        EXIT_SHORT → CTP BUY CLOSE_TODAY  + HL SELL (reduce_only)
-        """
         hl_size_oz = ag_lots_to_hl_oz(lots)
 
-        # CTP 方向和开平
         ag_direction, ag_offset = self._signal_to_ctp_params(signal.signal)
-
-        # HL 方向
         hl_is_buy = signal.signal in (Signal.SHORT, Signal.EXIT_SHORT)
         hl_reduce_only = signal.signal.name.startswith("EXIT")
 
-        # CTP 价格: 对手价 + buffer
         ag_price = self._calculate_ag_price(signal, ag_direction)
-
-        # HL 价格: mid + 滑点
         hl_price = self._calculate_hl_price(signal, hl_is_buy)
 
         logger.info(
-            f"执行 {signal.signal.value}: "
-            f"CTP {ag_direction} {ag_offset} {self._pair.ctp_instrument} "
-            f"{lots}手 @¥{ag_price:.1f} | "
-            f"HL {'BUY' if hl_is_buy else 'SELL'} "
-            f"{hl_size_oz:.2f}oz @${hl_price:.4f}"
+            f"执行 {signal.signal.value}: CTP {ag_direction} {ag_offset} {self._pair.ctp_instrument} "
+            f"{lots}手 @¥{ag_price:.1f} | HL {'BUY' if hl_is_buy else 'SELL'} {hl_size_oz:.2f}oz @${hl_price:.4f}"
         )
 
-        # 双腿并发执行
         t_start = time.monotonic()
-        ag_coro = self._ctp.place_order(
-            instrument_id=self._pair.ctp_instrument,
-            direction=ag_direction,
-            offset=ag_offset,
-            price=ag_price,
-            volume=lots,
-            timeout=self._timeout,
+        ag_task = asyncio.ensure_future(
+            self._ctp.place_order(
+                instrument_id=self._pair.ctp_instrument,
+                direction=ag_direction,
+                offset=ag_offset,
+                price=ag_price,
+                volume=lots,
+                timeout=self._timeout,
+            )
         )
-
-        hl_coro = self._hl.place_order(
-            coin=f"xyz:{self._pair.hl_symbol}",
-            is_buy=hl_is_buy,
-            size=hl_size_oz,
-            price=round(hl_price, 4),
-            reduce_only=hl_reduce_only,
+        hl_task = asyncio.ensure_future(
+            self._hl.place_order(
+                coin=f"xyz:{self._pair.hl_symbol}",
+                is_buy=hl_is_buy,
+                size=hl_size_oz,
+                price=round(hl_price, 4),
+                reduce_only=hl_reduce_only,
+                tif=STRATEGY.hl_order_tif,
+            )
         )
-
-        ag_task = asyncio.ensure_future(ag_coro)
-        hl_task = asyncio.ensure_future(hl_coro)
 
         try:
-            # CTP 内部有 self._timeout 超时, HL 无内置超时
-            # 总超时 = 单腿超时 + 2s 缓冲 (避免 CTP 超时后再等太久)
-            results = await asyncio.wait_for(
+            ag_result, hl_result = await asyncio.wait_for(
                 asyncio.gather(ag_task, hl_task, return_exceptions=True),
                 timeout=self._timeout + 2,
             )
-
-            ag_result, hl_result = results
-
         except asyncio.TimeoutError:
-            # 显式取消仍在执行的任务, 防止后台残留下单
             ag_task.cancel()
             hl_task.cancel()
-            logger.error("双腿执行超时! 已取消残余任务")
+            logger.error("双腿执行超时")
             self._audit_trade(
-                signal=signal, lots=lots, hl_size_oz=hl_size_oz,
-                ag_fill=0, hl_fill=0, fees=0,
-                status="timeout", latency_ms=(time.monotonic() - t_start) * 1000,
+                signal=signal,
+                lots=lots,
+                hl_size_oz=hl_size_oz,
+                ag_fill=0,
+                hl_fill=0,
+                fees=0,
+                status="timeout",
+                latency_ms=(time.monotonic() - t_start) * 1000,
             )
             return DualLegResult(
-                lots=lots, hl_size_oz=hl_size_oz,
-                status="timeout", error="双腿执行超时"
+                lots=lots,
+                hl_size_oz=hl_size_oz,
+                status="timeout",
+                error="双腿执行超时",
+                exposure_unresolved=True,
             )
 
-        # 检查腿失败(异常级别)
         ag_failed = isinstance(ag_result, Exception)
         hl_failed = isinstance(hl_result, Exception)
 
         if ag_failed and hl_failed:
-            error = f"双腿均失败: AG={ag_result}, HL={hl_result}"
-            logger.error(error)
+            err = f"双腿均失败: AG={ag_result}, HL={hl_result}"
+            logger.error(err)
             return DualLegResult(
-                lots=lots, hl_size_oz=hl_size_oz,
-                status="error", error=error
+                lots=lots,
+                hl_size_oz=hl_size_oz,
+                status="error",
+                error=err,
+                exposure_unresolved=True,
             )
 
         if ag_failed or hl_failed:
             return await self._handle_leg_failure(
-                ag_result, hl_result, signal, lots, hl_size_oz,
-                ag_direction, hl_is_buy,
+                ag_result=ag_result,
+                hl_result=hl_result,
+                signal=signal,
+                lots=lots,
+                hl_size_oz=hl_size_oz,
+                ag_direction=ag_direction,
+                hl_is_buy=hl_is_buy,
             )
 
-        # CTP 成交状态
         ag_order = ag_result if isinstance(ag_result, CTPOrderResult) else None
         ag_status = ag_order.status if ag_order else "error"
-        ag_filled = (
-            ag_order is not None and
-            (ag_order.status == "filled" or ag_order.filled_volume > 0)
-        )
-        ag_fill = (
-            ag_order.filled_price
-            if ag_order and ag_order.filled_price > 0
-            else ag_price
-        )
+        ag_filled = bool(ag_order and (ag_order.status == "filled" or ag_order.filled_volume > 0))
+        ag_fill = ag_order.filled_price if ag_order and ag_order.filled_price > 0 else ag_price
 
-        if ag_status not in ("filled", "partial"):
-            return await self._handle_leg_failure(
-                ag_result, hl_result, signal, lots, hl_size_oz,
-                ag_direction, hl_is_buy,
-                ag_filled=ag_filled,
-            )
-
-        # HL 成交状态
         hl_order = hl_result if isinstance(hl_result, dict) else None
-        hl_accepted, hl_filled, hl_fill_price, hl_error, hl_resting = self._parse_hl_order(hl_order)
+        hl_accepted, hl_filled, hl_filled_size_oz, hl_fill_price, hl_error, hl_resting = self._parse_hl_order(hl_order)
+        if hl_filled and hl_filled_size_oz <= 0:
+            hl_filled_size_oz = hl_size_oz
 
-        # 如果 HL 订单 resting (挂单未成交), 先尝试取消再走腿失败流程
         if hl_resting:
-            logger.warning("HL 订单处于 resting 状态, 尝试取消挂单")
             try:
                 await self._hl.cancel_all_orders(coin=f"xyz:{self._pair.hl_symbol}")
             except Exception as e:
-                logger.error(f"取消 HL resting 订单失败: {e}")
+                logger.warning(f"取消 HL resting 订单失败: {e}")
 
-        if not hl_accepted or not hl_filled:
-            reason = hl_error or "HL order not filled"
+        # treat partial HL fill as failure needing repair
+        hl_partial = hl_filled and (hl_filled_size_oz + 1e-6 < hl_size_oz)
+        if ag_status not in ("filled", "partial") or (not hl_accepted) or (not hl_filled) or hl_partial:
+            reason = hl_error or ("HL partial fill" if hl_partial else "leg status abnormal")
             return await self._handle_leg_failure(
-                ag_result, hl_result, signal, lots, hl_size_oz,
-                ag_direction, hl_is_buy,
+                ag_result=ag_result,
+                hl_result=hl_result,
+                signal=signal,
+                lots=lots,
+                hl_size_oz=hl_size_oz,
+                ag_direction=ag_direction,
+                hl_is_buy=hl_is_buy,
                 ag_filled=ag_filled,
                 hl_filled=hl_filled,
-                extra_error=f"HL状态异常: {reason}",
+                hl_filled_size_oz=hl_filled_size_oz,
+                extra_error=reason,
             )
 
-        # 计算费用
-        ag_fee = calculate_ag_fee(ag_fill, lots)
+        effective_hl_oz = hl_filled_size_oz if hl_filled_size_oz > 0 else hl_size_oz
         final_hl_fill = hl_fill_price if hl_fill_price > 0 else hl_price
-        hl_fee = calculate_hl_fee(final_hl_fill, hl_size_oz)
+        ag_fee = calculate_ag_fee(ag_fill, lots)
+        hl_fee = calculate_hl_fee(final_hl_fill, effective_hl_oz)
         total_fee_rmb = ag_fee + hl_fee * signal.usdcny
 
-        result = DualLegResult(
+        latency_ms = (time.monotonic() - t_start) * 1000
+        self._audit_trade(
+            signal=signal,
+            lots=lots,
+            hl_size_oz=effective_hl_oz,
+            ag_fill=ag_fill,
+            hl_fill=final_hl_fill,
+            fees=total_fee_rmb,
+            status="filled",
+            latency_ms=latency_ms,
+            ag_slippage=ag_fill - ag_price,
+            hl_slippage=final_hl_fill - hl_price,
+        )
+
+        return DualLegResult(
             ag_order=ag_order,
             ag_fill_price=ag_fill,
             hl_order=hl_order,
             hl_fill_price=final_hl_fill,
             lots=lots,
-            hl_size_oz=hl_size_oz,
+            hl_size_oz=effective_hl_oz,
             ag_fee_rmb=ag_fee,
             hl_fee_usd=hl_fee,
             total_fee_rmb=total_fee_rmb,
             status="filled",
+            exposure_unresolved=False,
         )
 
-        latency_ms = (time.monotonic() - t_start) * 1000
-        logger.info(
-            f"交易完成: AG @¥{ag_fill:.1f}, HL @${final_hl_fill:.4f}, "
-            f"费用=¥{total_fee_rmb:.2f}, 延迟={latency_ms:.0f}ms"
-        )
-
-        self._audit_trade(
-            signal=signal, lots=lots, hl_size_oz=hl_size_oz,
-            ag_fill=ag_fill, hl_fill=final_hl_fill, fees=total_fee_rmb,
-            status="filled", latency_ms=latency_ms,
-            ag_slippage=ag_fill - ag_price,
-            hl_slippage=final_hl_fill - hl_price,
-        )
-
-        return result
-
-    def _parse_hl_order(self, result: Optional[dict]) -> Tuple[bool, bool, float, str, bool]:
-        """解析 Hyperliquid 下单结果: (accepted, filled, fill_price, error, resting)."""
+    def _parse_hl_order(self, result: Optional[dict]) -> Tuple[bool, bool, float, float, str, bool]:
         if not isinstance(result, dict):
-            return False, False, 0.0, "invalid response type", False
+            return False, False, 0.0, 0.0, "invalid response type", False
 
         top_status = str(result.get("status", "")).lower()
         if top_status and top_status != "ok":
-            return False, False, 0.0, f"status={top_status}", False
+            return False, False, 0.0, 0.0, f"status={top_status}", False
 
         response = result.get("response", {})
         data = response.get("data", {}) if isinstance(response, dict) else {}
         statuses = data.get("statuses", []) if isinstance(data, dict) else []
         if not statuses:
-            return False, False, 0.0, "missing statuses", False
+            return False, False, 0.0, 0.0, "missing statuses", False
 
         accepted = True
         filled = False
         resting = False
         fill_price = 0.0
+        filled_size_oz = 0.0
         errors = []
 
         for st in statuses:
             if not isinstance(st, dict):
                 continue
-
             if "error" in st:
                 accepted = False
                 errors.append(str(st.get("error")))
                 continue
-
             if "filled" in st and isinstance(st["filled"], dict):
                 filled = True
-                px = st["filled"].get("avgPx") or st["filled"].get("px")
-                if px is not None:
+                fp = st["filled"].get("avgPx") or st["filled"].get("px")
+                if fp is not None:
                     try:
-                        fill_price = float(px)
-                    except (TypeError, ValueError):
+                        fill_price = float(fp)
+                    except Exception:
+                        pass
+                fsz = st["filled"].get("totalSz") or st["filled"].get("sz")
+                if fsz is not None:
+                    try:
+                        filled_size_oz += float(fsz)
+                    except Exception:
                         pass
                 continue
-
             if "resting" in st:
-                # 订单挂在盘口未立即成交, 需要取消
-                accepted = True
                 resting = True
 
         if not filled:
-            error_msg = "; ".join(errors) if errors else ("resting (not filled)" if resting else "not filled")
-            return accepted, False, 0.0, error_msg, resting
+            err = "; ".join(errors) if errors else ("resting (not filled)" if resting else "not filled")
+            return accepted, False, 0.0, 0.0, err, resting
 
-        return accepted, True, fill_price, "", False
+        return accepted, True, filled_size_oz, fill_price, "", resting
 
     def _signal_to_ctp_params(self, signal: Signal) -> Tuple[str, str]:
-        """信号 → CTP 方向和开平标志"""
         mapping = {
             Signal.LONG: ("BUY", "OPEN"),
             Signal.SHORT: ("SELL", "OPEN"),
@@ -300,24 +274,101 @@ class ExecutionEngine:
         return mapping[signal]
 
     def _calculate_ag_price(self, signal: SignalResult, direction: str) -> float:
-        """计算 CTP 下单价格 (对手价 + buffer)"""
         if direction == "BUY":
-            # 买入: 用卖一价 + 1 tick
-            price = signal.ag_price + 1  # AG tick = 1
+            price = signal.ag_price + 1
         else:
-            # 卖出: 用买一价 - 1 tick
             price = signal.ag_price - 1
-
-        # AG 价格精度: 整数
         return round(price, 0)
 
     def _calculate_hl_price(self, signal: SignalResult, is_buy: bool) -> float:
-        """计算 HL 下单价格 (mid + slippage)"""
         slippage = STRATEGY.hl_order_slippage_pct
         if is_buy:
             return signal.hl_price_usd_oz * (1 + slippage)
-        else:
-            return signal.hl_price_usd_oz * (1 - slippage)
+        return signal.hl_price_usd_oz * (1 - slippage)
+
+    async def _wait_ctp_fill_for_seconds(self, ag_order: Optional[CTPOrderResult], wait_sec: int) -> int:
+        if ag_order is None:
+            return 0
+        deadline = time.time() + max(1, int(wait_sec))
+        while time.time() < deadline:
+            fv = int(getattr(ag_order, "filled_volume", 0) or 0)
+            st = str(getattr(ag_order, "status", "") or "").lower()
+            if fv > 0:
+                return fv
+            if st == "filled":
+                return 1
+            await asyncio.sleep(1.0)
+        return int(getattr(ag_order, "filled_volume", 0) or 0)
+
+    async def _repair_hl_with_ioc(
+        self,
+        signal: SignalResult,
+        is_buy: bool,
+        target_size_oz: float,
+        reduce_only: bool,
+        timeout_sec: int,
+    ) -> tuple[bool, float, float]:
+        if target_size_oz <= 1e-8:
+            return True, 0.0, 0.0
+
+        filled_sum = 0.0
+        notional_sum = 0.0
+        coin = f"xyz:{self._pair.hl_symbol}"
+        deadline = time.time() + max(1, int(timeout_sec))
+
+        while time.time() < deadline and (target_size_oz - filled_sum) > 1e-6:
+            remain = target_size_oz - filled_sum
+            size = round(remain, 2)
+            if size <= 0:
+                break
+            px = round(self._calculate_hl_price(signal, is_buy), 4)
+            try:
+                r = await self._hl.place_order(
+                    coin=coin,
+                    is_buy=is_buy,
+                    size=size,
+                    price=px,
+                    order_type="Limit",
+                    tif="Ioc",
+                    reduce_only=reduce_only,
+                )
+            except Exception as e:
+                logger.warning(f"HL IOC 修复异常: {e}")
+                await asyncio.sleep(self._hl_repair_interval_sec)
+                continue
+
+            accepted, _, fsz, fpx, err, resting = self._parse_hl_order(r)
+            if resting:
+                try:
+                    await self._hl.cancel_all_orders(coin=coin)
+                except Exception:
+                    pass
+            if (not accepted) and fsz <= 1e-8:
+                logger.warning(f"HL IOC 修复未成交: {err}")
+                await asyncio.sleep(self._hl_repair_interval_sec)
+                continue
+            if fsz > 0:
+                filled_sum += fsz
+                px_used = fpx if fpx > 0 else px
+                notional_sum += fsz * px_used
+            else:
+                await asyncio.sleep(self._hl_repair_interval_sec)
+
+        ok = (target_size_oz - filled_sum) <= 1e-6
+        avg_px = (notional_sum / filled_sum) if filled_sum > 0 else 0.0
+        return ok, filled_sum, avg_px
+
+    async def _safe_cancel_ctp_order(self, ag_order: Optional[CTPOrderResult]):
+        if ag_order is None:
+            return
+        try:
+            await self._ctp.cancel_order(
+                instrument_id=self._pair.ctp_instrument,
+                order_ref=ag_order.order_ref,
+                order_sys_id=ag_order.order_sys_id or "",
+            )
+        except Exception as e:
+            logger.warning(f"CTP 撤单异常(忽略): {e}")
 
     async def _handle_leg_failure(
         self,
@@ -330,87 +381,150 @@ class ExecutionEngine:
         hl_is_buy: bool,
         ag_filled: Optional[bool] = None,
         hl_filled: Optional[bool] = None,
+        hl_filled_size_oz: float = 0.0,
         extra_error: str = "",
     ) -> DualLegResult:
-        """
-        处理单腿失败: 已成交的腿紧急平掉
-
-        这是关键的风控逻辑:
-        - AG 成交但 HL 失败 → 立即反向平 AG
-        - HL 成交但 AG 失败 → 立即反向平 HL
-        """
         ag_failed = isinstance(ag_result, Exception)
         hl_failed = isinstance(hl_result, Exception)
-        if ag_filled is None:
-            ag_order = ag_result if isinstance(ag_result, CTPOrderResult) else None
-            ag_filled = (
-                ag_order is not None and
-                (ag_order.status == "filled" or ag_order.filled_volume > 0)
-            )
-        if hl_filled is None:
-            hl_order = hl_result if isinstance(hl_result, dict) else None
-            _, hl_filled, _, _, _ = self._parse_hl_order(hl_order)
 
-        error_msg = (
-            f"腿失败: AG={'失败' if ag_failed else '成功'}(成交={ag_filled}), "
-            f"HL={'失败' if hl_failed else '成功'}(成交={hl_filled})"
+        ag_order = ag_result if isinstance(ag_result, CTPOrderResult) else None
+        if ag_filled is None:
+            ag_filled = bool(ag_order and (ag_order.status == "filled" or ag_order.filled_volume > 0))
+        ag_filled_lots = int(ag_order.filled_volume or 0) if ag_order else 0
+        if ag_filled and ag_filled_lots <= 0:
+            ag_filled_lots = lots
+
+        hl_order = hl_result if isinstance(hl_result, dict) else None
+        if hl_filled is None:
+            _, hl_filled, parsed_hl_oz, _, _, _ = self._parse_hl_order(hl_order)
+            if hl_filled_size_oz <= 0:
+                hl_filled_size_oz = parsed_hl_oz
+        if hl_filled and hl_filled_size_oz <= 0:
+            hl_filled_size_oz = hl_size_oz
+
+        err = (
+            f"腿失败: AG={'失败' if ag_failed else '成功'}(成交={ag_filled_lots}), "
+            f"HL={'失败' if hl_failed else '成功'}(成交oz={hl_filled_size_oz:.4f})"
         )
         if extra_error:
-            error_msg = f"{error_msg} | {extra_error}"
-        logger.error(error_msg)
-
+            err = f"{err} | {extra_error}"
+        logger.error(err)
         if self._notifier:
-            await self._notifier.notify_emergency(
-                f"{error_msg}\nAG: {ag_result}\nHL: {hl_result}"
+            await self._notifier.notify_emergency(f"{err}\nAG: {ag_result}\nHL: {hl_result}")
+
+        # Branch A: CTP filled, HL not enough -> keep CTP, repair HL via IOC.
+        if ag_filled_lots > 0:
+            target_hl_oz = ag_lots_to_hl_oz(ag_filled_lots)
+            gap_oz = max(0.0, target_hl_oz - hl_filled_size_oz)
+            if gap_oz > 1e-6:
+                ok, repaired_oz, repaired_px = await self._repair_hl_with_ioc(
+                    signal=signal,
+                    is_buy=hl_is_buy,
+                    target_size_oz=gap_oz,
+                    reduce_only=False,
+                    timeout_sec=self._hl_repair_timeout_sec,
+                )
+                total_hl_oz = hl_filled_size_oz + repaired_oz
+                if ok:
+                    ag_fill = ag_order.filled_price if ag_order and ag_order.filled_price > 0 else self._calculate_ag_price(signal, ag_direction)
+                    hl_fill = repaired_px if repaired_px > 0 else self._calculate_hl_price(signal, hl_is_buy)
+                    ag_fee = calculate_ag_fee(ag_fill, ag_filled_lots)
+                    hl_fee = calculate_hl_fee(hl_fill, total_hl_oz)
+                    total_fee_rmb = ag_fee + hl_fee * signal.usdcny
+                    return DualLegResult(
+                        ag_order=ag_order,
+                        ag_fill_price=ag_fill,
+                        hl_order=hl_order,
+                        hl_fill_price=hl_fill,
+                        lots=ag_filled_lots,
+                        hl_size_oz=total_hl_oz,
+                        ag_fee_rmb=ag_fee,
+                        hl_fee_usd=hl_fee,
+                        total_fee_rmb=total_fee_rmb,
+                        status="filled",
+                        exposure_unresolved=False,
+                    )
+
+                final_err = f"{err} | HL补单失败, 残余gap={max(0.0, target_hl_oz-total_hl_oz):.4f}oz"
+                self._audit_trade(signal, lots, hl_size_oz, 0, 0, 0, "leg_failure", extra_info=final_err)
+                return DualLegResult(
+                    ag_order=ag_order,
+                    lots=lots,
+                    hl_size_oz=hl_size_oz,
+                    status="leg_failure",
+                    error=final_err,
+                    exposure_unresolved=True,
+                )
+
+        # Branch B: HL filled first, CTP not filled -> wait CTP, else cancel CTP and rollback HL.
+        if hl_filled_size_oz > 1e-6 and ag_filled_lots <= 0:
+            filled_lots_after_wait = await self._wait_ctp_fill_for_seconds(ag_order, self._ctp_wait_repair_sec)
+            if filled_lots_after_wait > 0:
+                target_hl_oz = ag_lots_to_hl_oz(filled_lots_after_wait)
+                gap_oz = max(0.0, target_hl_oz - hl_filled_size_oz)
+                if gap_oz <= 1e-6:
+                    return DualLegResult(
+                        ag_order=ag_order,
+                        lots=filled_lots_after_wait,
+                        hl_size_oz=target_hl_oz,
+                        status="filled",
+                        exposure_unresolved=False,
+                    )
+                ok, repaired_oz, _ = await self._repair_hl_with_ioc(
+                    signal=signal,
+                    is_buy=hl_is_buy,
+                    target_size_oz=gap_oz,
+                    reduce_only=False,
+                    timeout_sec=self._hl_repair_timeout_sec,
+                )
+                if ok:
+                    return DualLegResult(
+                        ag_order=ag_order,
+                        lots=filled_lots_after_wait,
+                        hl_size_oz=hl_filled_size_oz + repaired_oz,
+                        status="filled",
+                        exposure_unresolved=False,
+                    )
+
+            await self._safe_cancel_ctp_order(ag_order)
+            rollback_ok, rollback_oz, _ = await self._repair_hl_with_ioc(
+                signal=signal,
+                is_buy=not hl_is_buy,
+                target_size_oz=hl_filled_size_oz,
+                reduce_only=True,
+                timeout_sec=self._hl_repair_timeout_sec,
+            )
+            if rollback_ok:
+                info = f"{err} | CTP未成, 已撤CTP并平HL {rollback_oz:.4f}oz"
+                self._audit_trade(signal, lots, hl_size_oz, 0, 0, 0, "rolled_back", extra_info=info)
+                return DualLegResult(
+                    ag_order=ag_order,
+                    lots=lots,
+                    hl_size_oz=hl_size_oz,
+                    status="rolled_back",
+                    error=info,
+                    exposure_unresolved=False,
+                )
+
+            final_err = f"{err} | CTP未成, HL回滚失败"
+            self._audit_trade(signal, lots, hl_size_oz, 0, 0, 0, "leg_failure", extra_info=final_err)
+            return DualLegResult(
+                ag_order=ag_order,
+                lots=lots,
+                hl_size_oz=hl_size_oz,
+                status="leg_failure",
+                error=final_err,
+                exposure_unresolved=True,
             )
 
-        # 紧急平仓
-        emergency_close_failed = False
-        if ag_filled:
-            # AG 成交了, HL 失败 → 反向平 AG
-            reverse_dir = "SELL" if ag_direction == "BUY" else "BUY"
-            try:
-                logger.warning(f"紧急平仓 AG: {reverse_dir} {lots}手")
-                await self._ctp.market_order(
-                    instrument_id=self._pair.ctp_instrument,
-                    direction=reverse_dir,
-                    offset="CLOSE_TODAY",
-                    volume=lots,
-                )
-            except Exception as e:
-                emergency_close_failed = True
-                logger.critical(f"紧急平仓 AG 失败! {e}")
-
-        if hl_filled:
-            # HL 成交了, AG 失败 → 反向平 HL
-            try:
-                logger.warning(f"紧急平仓 HL: {'SELL' if hl_is_buy else 'BUY'} {hl_size_oz}oz")
-                await self._hl.market_order(
-                    coin=f"xyz:{self._pair.hl_symbol}",
-                    is_buy=not hl_is_buy,
-                    size=hl_size_oz,
-                )
-            except Exception as e:
-                emergency_close_failed = True
-                logger.critical(f"紧急平仓 HL 失败! {e}")
-
-        if emergency_close_failed and self._notifier:
-            await self._notifier.notify_emergency(
-                f"紧急平仓失败! 需要人工介入!\n{error_msg}"
-            )
-
-        self._audit_trade(
-            signal=signal, lots=lots, hl_size_oz=hl_size_oz,
-            ag_fill=0, hl_fill=0, fees=0,
-            status="leg_failure", latency_ms=0,
-            extra_info=error_msg,
-        )
-
+        self._audit_trade(signal, lots, hl_size_oz, 0, 0, 0, "leg_failure", extra_info=err)
         return DualLegResult(
+            ag_order=ag_order,
             lots=lots,
             hl_size_oz=hl_size_oz,
             status="leg_failure",
-            error=error_msg,
+            error=err,
+            exposure_unresolved=True,
         )
 
     def _audit_trade(
@@ -427,11 +541,10 @@ class ExecutionEngine:
         hl_slippage: float = 0,
         extra_info: str = "",
     ):
-        """写入交易审计 CSV 日志"""
         filepath = os.path.join(self._audit_dir, f"trades_{date.today().isoformat()}.csv")
         write_header = not os.path.exists(filepath)
         try:
-            with open(filepath, 'a', newline='') as f:
+            with open(filepath, "a", newline="") as f:
                 writer = csv.writer(f)
                 if write_header:
                     writer.writerow([

@@ -1,62 +1,59 @@
-# unit_converter.py - 白银合约单位换算和费率计算
-#
-# SHFE AG: RMB/kg, 15 kg/手
-# HL SILVER: USD/oz
-# 换算: 1 troy oz = 0.0311035 kg
+# unit_converter.py - unit conversion and fee helpers for AG/HL arbitrage
 
-# ==================== 常量 ====================
+from config import STRATEGY
 
-OUNCE_TO_KG = 0.0311035          # 1 金衡盎司 = 0.0311035 kg
-AG_LOT_KG = 15                   # SHFE 白银: 1手 = 15 kg
-HL_LOT_OZ = AG_LOT_KG / OUNCE_TO_KG  # ~482.25 oz (1手AG对应的HL盎司数)
-AG_TICK_SIZE = 1                  # AG 最小变动价位: 1 RMB/kg
-AG_FEE_PER_LOT = 0.01            # 1手(1张)手续费 0.01 RMB per side
-HL_FEE_RATE = 0.000405           # 0.0405% taker per side
-SLIPPAGE_RATE = 0.0001           # 0.01% per side per leg
-DEFAULT_USDCNY = 7.25            # 默认汇率 (fallback)
+# Constants
+OUNCE_TO_KG = 0.0311035
+AG_LOT_KG = 15
+HL_LOT_OZ = AG_LOT_KG / OUNCE_TO_KG
+AG_TICK_SIZE = 1
+SLIPPAGE_RATE = 0.0001
+DEFAULT_USDCNY = 7.25
 
 
-# ==================== 价格换算 ====================
+# Price conversion
 
 def hl_usd_oz_to_cny_kg(price_usd_oz: float, usdcny: float) -> float:
-    """HL价格 (USD/oz) → RMB/kg"""
+    """Convert HL price from USD/oz to RMB/kg."""
     return price_usd_oz * usdcny / OUNCE_TO_KG
 
 
 def cny_kg_to_usd_oz(price_cny_kg: float, usdcny: float) -> float:
-    """RMB/kg → USD/oz"""
+    """Convert price from RMB/kg to USD/oz."""
     if usdcny <= 0:
         return 0
     return price_cny_kg * OUNCE_TO_KG / usdcny
 
 
-# ==================== 数量换算 ====================
+# Size conversion
 
 def ag_lots_to_hl_oz(lots: int) -> float:
-    """AG 手数 → HL 盎司数: lots * 15 / 0.0311035"""
+    """AG lots -> HL ounces."""
     return lots * AG_LOT_KG / OUNCE_TO_KG
 
 
 def hl_oz_to_ag_lots(oz: float) -> int:
-    """HL 盎司数 → AG 手数 (向下取整)"""
+    """HL ounces -> AG lots (floor)."""
     return int(oz * OUNCE_TO_KG / AG_LOT_KG)
 
 
 def ag_lots_to_kg(lots: int) -> float:
-    """AG 手数 → 公斤数"""
+    """AG lots -> kilograms."""
     return lots * AG_LOT_KG
 
 
-# ==================== 费用计算 ====================
+# Fee calculation
 
 def calculate_ag_fee(price_cny_kg: float, lots: int) -> float:
-    """AG 单边手续费 (RMB) = price * 15kg * lots * 0.00005"""
-    return max(lots, 0) * AG_FEE_PER_LOT
+    """AG single-side fee in RMB = price * 15kg * lots * fee_rate."""
+    lots = max(lots, 0)
+    notional_rmb = price_cny_kg * AG_LOT_KG * lots
+    return notional_rmb * STRATEGY.ag_fee_rate
 
 
 def calculate_hl_fee(price_usd_oz: float, size_oz: float) -> float:
-    """HL 单边手续费 (USD) = price * size * 0.00035"""
-    return price_usd_oz * size_oz * HL_FEE_RATE
+    """HL single-side fee in USD = price * size * fee_rate."""
+    return price_usd_oz * size_oz * STRATEGY.hl_fee_rate
 
 
 def calculate_round_trip_fee(
@@ -67,17 +64,20 @@ def calculate_round_trip_fee(
     lots: int,
     usdcny: float,
 ) -> float:
-    """计算往返总费用 (RMB), 包含 AG + HL + 滑点"""
+    """Estimate round-trip total cost in RMB: AG + HL + slippage."""
+    lots = max(lots, 0)
     hl_size_oz = ag_lots_to_hl_oz(lots)
 
-    # AG 往返手续费 (RMB)
-    ag_fee = max(lots, 0) * AG_FEE_PER_LOT * 2
+    # AG round-trip fees (RMB)
+    ag_fee_entry = ag_entry_price * AG_LOT_KG * lots * STRATEGY.ag_fee_rate
+    ag_fee_exit = ag_exit_price * AG_LOT_KG * lots * STRATEGY.ag_fee_rate
+    ag_fee = ag_fee_entry + ag_fee_exit
 
-    # HL 往返手续费 (USD → RMB)
-    hl_fee_usd = (hl_entry_price + hl_exit_price) * hl_size_oz * HL_FEE_RATE
+    # HL round-trip fees (USD -> RMB)
+    hl_fee_usd = (hl_entry_price + hl_exit_price) * hl_size_oz * STRATEGY.hl_fee_rate
     hl_fee_rmb = hl_fee_usd * usdcny
 
-    # 滑点 (双边双腿)
+    # Slippage (both legs, both sides)
     ag_notional = (ag_entry_price + ag_exit_price) / 2 * AG_LOT_KG * lots
     hl_notional_rmb = (hl_entry_price + hl_exit_price) / 2 * hl_size_oz * usdcny
     slippage = (ag_notional + hl_notional_rmb) * SLIPPAGE_RATE * 2
