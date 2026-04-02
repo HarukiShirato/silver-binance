@@ -325,6 +325,8 @@ class RiskConfig:
     position_reconcile_interval_sec: int = 60
     position_mismatch_alert_cooldown_sec: int = 60
     hl_quote_ws_down_alert_cooldown_sec: int = 60
+    position_reconcile_consistency_count: int = 3
+    position_reconcile_correction_cooldown_sec: int = 120
 
 RISK = RiskConfig()
 

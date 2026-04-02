@@ -162,6 +162,9 @@ class SilverHedgeBot:
         self._position_phase = "NONE"  # NONE | PENDING_ENTRY_* | PENDING_EXIT_*
         self._pending_signal_id = ""
         self._pending_since = 0.0
+        self._position_mismatch_streak = 0
+        self._position_mismatch_fingerprint = ""
+        self._last_position_correction_ts = 0.0
 
     async def initialize(self):
         """Initialize exchanges and data sources."""
@@ -544,7 +547,8 @@ class SilverHedgeBot:
                         )
                     except Exception as notify_err:
                         logger.error(f"DRY_RUN 通知失败(不影响成交记录): {notify_err}")
-                self.risk_manager.set_cooldown(STRATEGY.cooldown_seconds)
+                if is_entry:
+                    self.risk_manager.set_cooldown(STRATEGY.cooldown_seconds)
             else:
                 self.risk_manager.record_trade_result('SILVER', 0, "failed")
                 self._decision_stats["dry_run_remote_failed"] += 1
@@ -586,7 +590,8 @@ class SilverHedgeBot:
                 )
                 if NOTIFY.notify_on_error:
                     await self.notifier.notify_error(result.error, 'SILVER')
-            self.risk_manager.set_cooldown(STRATEGY.cooldown_seconds)
+            if is_entry:
+                self.risk_manager.set_cooldown(STRATEGY.cooldown_seconds)
             self._clear_pending_phase()
         except Exception as e:
             logger.error(f"交易执行异常: {e}")
@@ -867,6 +872,18 @@ class SilverHedgeBot:
 
                 msg = self._build_position_mismatch_message(truth)
                 if msg:
+                    fingerprint = (
+                        f"{truth['truth_side']}|{truth['truth_lots']:.2f}|"
+                        f"{truth['ctp_side']}|{truth['ctp_lots']:.2f}|"
+                        f"{truth['hl_side']}|{truth['hl_lots']:.2f}|"
+                        f"{truth['exposure_reason']}"
+                    )
+                    if fingerprint == self._position_mismatch_fingerprint:
+                        self._position_mismatch_streak += 1
+                    else:
+                        self._position_mismatch_fingerprint = fingerprint
+                        self._position_mismatch_streak = 1
+
                     logger.warning(msg)
                     if msg != self._last_position_mismatch_msg or self._should_send_alert(
                         "position_mismatch",
@@ -876,6 +893,8 @@ class SilverHedgeBot:
                     self._last_position_mismatch_msg = msg
                 else:
                     self._last_position_mismatch_msg = ""
+                    self._position_mismatch_streak = 0
+                    self._position_mismatch_fingerprint = ""
 
                 if truth["exposure_reason"]:
                     reason = f"单边暴露: {truth['exposure_reason']}"
@@ -888,18 +907,46 @@ class SilverHedgeBot:
                 if self._position_phase == "NONE":
                     target_side = truth["truth_side"]
                     target_lots = int(round(truth["truth_lots"]))
-                    if (
+                    mismatch = (
                         self.signal_engine.position != target_side
                         or self.position_manager.current_lots != target_lots
-                    ):
-                        logger.warning(
-                            "外部仓位修正本地状态: "
-                            f"local={self.signal_engine.position}/{self.position_manager.current_lots} "
-                            f"-> truth={target_side}/{target_lots}"
-                        )
-                        self.signal_engine.set_position(target_side)
-                        self.position_manager.current_lots = target_lots
-                        self.risk_manager.save_position_state("SILVER", target_side, target_lots)
+                    )
+                    if mismatch:
+                        if RUNTIME.dry_run:
+                            logger.info(
+                                "DRY_RUN 不执行外部仓位修正: "
+                                f"local={self.signal_engine.position}/{self.position_manager.current_lots} "
+                                f"truth={target_side}/{target_lots} "
+                                f"streak={self._position_mismatch_streak}"
+                            )
+                        else:
+                            now_ts = time.time()
+                            enough_streak = self._position_mismatch_streak >= max(
+                                1, int(RISK.position_reconcile_consistency_count)
+                            )
+                            cool_ok = (
+                                now_ts - self._last_position_correction_ts
+                                >= max(1, int(RISK.position_reconcile_correction_cooldown_sec))
+                            )
+                            if enough_streak and cool_ok:
+                                logger.warning(
+                                    "外部仓位修正本地状态: "
+                                    f"local={self.signal_engine.position}/{self.position_manager.current_lots} "
+                                    f"-> truth={target_side}/{target_lots} "
+                                    f"streak={self._position_mismatch_streak}"
+                                )
+                                self.signal_engine.set_position(target_side)
+                                self.position_manager.current_lots = target_lots
+                                self.risk_manager.save_position_state("SILVER", target_side, target_lots)
+                                self._last_position_correction_ts = now_ts
+                            else:
+                                logger.info(
+                                    "外部仓位修正等待条件满足: "
+                                    f"streak={self._position_mismatch_streak}/"
+                                    f"{int(RISK.position_reconcile_consistency_count)} "
+                                    f"cooldown_left="
+                                    f"{max(0, int(RISK.position_reconcile_correction_cooldown_sec - (now_ts - self._last_position_correction_ts)))}s"
+                                )
             except Exception as e:
                 logger.warning(f"仓位对账异常: {e}")
 
