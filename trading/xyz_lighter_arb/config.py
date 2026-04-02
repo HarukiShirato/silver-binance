@@ -312,7 +312,7 @@ FOREX = ForexConfig()
 # ==================== 风控配置 ====================
 @dataclass
 class RiskConfig:
-    max_daily_trades: int = 0      # 每日最大交易次数 (0=不限制)
+    max_daily_trades: int = 3      # 每日最大交易次数 (0=不限制)
     max_daily_loss: float = 5000    # 每日最大亏损 (RMB)
     leg_timeout_sec: float = 2.0    # 第二腿超时时间 (秒)
     leg_retry_times: int = 2        # 第二腿重试次数

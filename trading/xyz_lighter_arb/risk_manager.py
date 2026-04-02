@@ -97,9 +97,10 @@ class RiskManager:
             remaining = self._cooldown_until - time.time()
             return False, f"Cooldown period, {remaining:.0f}s remaining"
 
-        # 每日交易次数限制
-        if self.max_daily_trades > 0 and self._daily_stats.trade_count >= self.max_daily_trades:
-            return False, f"Daily trade limit reached: {self.max_daily_trades}"
+        # 每日开仓笔数限制（一次开平算1笔，按开仓信号计数）
+        if signal in ("LONG", "SHORT"):
+            if self.max_daily_trades > 0 and self._daily_stats.trade_count >= self.max_daily_trades:
+                return False, f"Daily round-trip entry limit reached: {self.max_daily_trades}"
 
         # 每日亏损限制
         if self._daily_stats.total_pnl <= -self.max_daily_loss:
@@ -138,9 +139,8 @@ class RiskManager:
         )
 
         self._trades.append(trade)
-        self._daily_stats.trade_count += 1
-
         if signal in ["LONG", "SHORT"]:
+            self._daily_stats.trade_count += 1
             self._open_positions[pair_name] = trade
 
         return trade
@@ -217,7 +217,7 @@ class RiskManager:
         stats = self.daily_stats
         return (
             f"Date: {stats.date}\n"
-            f"Trades: {stats.trade_count}/{self.max_daily_trades}\n"
+            f"RoundTrips(entries): {stats.trade_count}/{self.max_daily_trades}\n"
             f"PnL: ${stats.total_pnl:.2f}\n"
             f"Win/Loss: {stats.win_count}/{stats.loss_count}\n"
             f"Max Drawdown: ${stats.max_drawdown:.2f}\n"
