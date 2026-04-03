@@ -157,6 +157,7 @@ class SilverHedgeBot:
         self._alert_last_notified: dict[str, float] = {}
         self._ctp_reconnect_lock = asyncio.Lock()
         self._signal_process_lock = asyncio.Lock()
+        self._ctp_query_lock = asyncio.Lock()
         self._ctp_connect_timeout_sec = 10
         self._ctp_paused_by_session = False
         self._session_open_retry_deadline = 0.0
@@ -170,6 +171,39 @@ class SilverHedgeBot:
         self._position_mismatch_streak = 0
         self._position_mismatch_fingerprint = ""
         self._last_position_correction_ts = 0.0
+
+    async def _query_ctp_account_safe(self):
+        if not self.ctp_gateway.is_connected:
+            return None
+        timeout_sec = max(3.0, float(RISK.ctp_query_timeout_sec))
+        async with self._ctp_query_lock:
+            try:
+                return await asyncio.wait_for(
+                    self.ctp_gateway.query_account(),
+                    timeout=timeout_sec,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"CTP query_account timeout>{timeout_sec}s")
+            except Exception as e:
+                logger.warning(f"CTP query_account failed: {e}")
+        return None
+
+    async def _query_ctp_positions_safe(self, instrument_id: str):
+        if not self.ctp_gateway.is_connected:
+            return []
+        timeout_sec = max(3.0, float(RISK.ctp_query_timeout_sec))
+        async with self._ctp_query_lock:
+            try:
+                result = await asyncio.wait_for(
+                    self.ctp_gateway.query_positions(instrument_id=instrument_id),
+                    timeout=timeout_sec,
+                )
+                return result or []
+            except asyncio.TimeoutError:
+                logger.warning(f"CTP query_positions timeout>{timeout_sec}s")
+            except Exception as e:
+                logger.warning(f"CTP query_positions failed: {e}")
+        return []
 
     async def initialize(self):
         """Initialize exchanges and data sources."""
@@ -734,7 +768,7 @@ class SilverHedgeBot:
         if not self.ctp_gateway.is_connected:
             return
 
-        acct = await self.ctp_gateway.query_account()
+        acct = await self._query_ctp_account_safe()
         if not acct:
             return
 
@@ -1068,7 +1102,7 @@ class SilverHedgeBot:
         }
 
     async def _get_ctp_position_side_lots(self, instrument_id: str) -> tuple[str, float]:
-        positions = await self.ctp_gateway.query_positions(instrument_id=instrument_id)
+        positions = await self._query_ctp_positions_safe(instrument_id=instrument_id)
         long_lots = 0.0
         short_lots = 0.0
         for pos in positions:

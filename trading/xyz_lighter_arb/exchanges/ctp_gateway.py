@@ -295,6 +295,11 @@ class CTPTdSpi(tdapi.CThostFtdcTraderSpi):
         """查询持仓回报"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             logger.error(f"CTP TD: 查询持仓失败, 错误={pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}")
+            self.gateway._query_errors['position'] = f"{pRspInfo.ErrorID}:{pRspInfo.ErrorMsg}"
+            if 'position' in self.gateway._query_events:
+                self.gateway._loop.call_soon_threadsafe(
+                    self.gateway._query_events['position'].set
+                )
             return
 
         if pInvestorPosition and pInvestorPosition.InstrumentID:
@@ -321,6 +326,11 @@ class CTPTdSpi(tdapi.CThostFtdcTraderSpi):
         """查询资金回报"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             logger.error(f"CTP TD: 查询资金失败, 错误={pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}")
+            self.gateway._query_errors['account'] = f"{pRspInfo.ErrorID}:{pRspInfo.ErrorMsg}"
+            if 'account' in self.gateway._query_events:
+                self.gateway._loop.call_soon_threadsafe(
+                    self.gateway._query_events['account'].set
+                )
             return
 
         if pTradingAccount:
@@ -401,6 +411,7 @@ class CTPGateway:
         self._pending_orders: Dict[str, OrderResult] = {}
         self._order_events: Dict[str, asyncio.Event] = {}
         self._query_events: Dict[str, asyncio.Event] = {}
+        self._query_errors: Dict[str, str] = {}
 
         # 线程引用 (非 daemon, 用于优雅关闭)
         self._md_thread: Optional[threading.Thread] = None
@@ -700,6 +711,7 @@ class CTPGateway:
             raise RuntimeError("交易 API 未连接")
 
         self._positions.clear()
+        self._query_errors.pop('position', None)
         self._query_events['position'] = asyncio.Event()
 
         req = tdapi.CThostFtdcQryInvestorPositionField()
@@ -719,6 +731,13 @@ class CTPGateway:
             )
         except asyncio.TimeoutError:
             logger.warning("查询持仓超时")
+            self._query_events.pop('position', None)
+            return []
+
+        if self._query_errors.get('position'):
+            logger.warning(f"查询持仓返回错误: {self._query_errors['position']}")
+            self._query_events.pop('position', None)
+            return []
 
         self._query_events.pop('position', None)
         return list(self._positions.values())
@@ -728,6 +747,8 @@ class CTPGateway:
         if not self._td_api:
             raise RuntimeError("交易 API 未连接")
 
+        self._account = None
+        self._query_errors.pop('account', None)
         self._query_events['account'] = asyncio.Event()
 
         req = tdapi.CThostFtdcQryTradingAccountField()
@@ -744,6 +765,13 @@ class CTPGateway:
             )
         except asyncio.TimeoutError:
             logger.warning("查询资金超时")
+            self._query_events.pop('account', None)
+            return None
+
+        if self._query_errors.get('account'):
+            logger.warning(f"查询资金返回错误: {self._query_errors['account']}")
+            self._query_events.pop('account', None)
+            return None
 
         self._query_events.pop('account', None)
         return self._account

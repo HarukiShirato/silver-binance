@@ -1,170 +1,199 @@
 #!/usr/bin/env python3
 """
-CTP 仿真环境连接测试脚本
+CTP connection check script.
 
-国贸期货仿真环境:
-  BrokerID: 0187
-  行情前置: tcp://140.206.244.75:41213
-  交易前置: tcp://140.206.244.75:41205
-
-使用方法:
-  # 设置环境变量
-  export CTP_USER_ID="你的仿真账号"
-  export CTP_PASSWORD="你的仿真密码"
-
-  # 运行测试
-  python3 test_ctp_connection.py
+Features:
+- load env file (.env/.env1)
+- configurable front retries
+- total hard timeout (avoid hanging forever)
+- optional market data sampling + account/position query
 """
 
+import argparse
 import asyncio
+import json
+import logging
 import os
 import sys
-import logging
+from pathlib import Path
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("CTPTest")
+logger = logging.getLogger("CTPConnCheck")
 
-# 添加项目路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from exchanges.ctp_gateway import CTPGateway, TickData
+from config import API, get_ctp_front_candidates, load_api_keys  # noqa: E402
+from exchanges.ctp_gateway import CTPGateway, TickData  # noqa: E402
 
 
-async def on_tick(tick: TickData):
-    """行情回调"""
+def _load_env_file(path: str) -> None:
+    p = Path(path)
+    if not p.is_absolute():
+        p = (Path.cwd() / p).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"env file not found: {p}")
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception as e:
+        raise RuntimeError("python-dotenv is required. pip install python-dotenv") from e
+    load_dotenv(dotenv_path=str(p), override=True)
+    logger.info(f"Loaded env file: {p}")
+
+
+async def _on_tick(tick: TickData):
     logger.info(
-        f"[{tick.instrument_id}] "
-        f"最新={tick.last_price:.1f} "
-        f"买一={tick.bid_price1:.1f}×{tick.bid_volume1} "
-        f"卖一={tick.ask_price1:.1f}×{tick.ask_volume1} "
-        f"量={tick.volume} 仓={tick.open_interest:.0f} "
-        f"时间={tick.update_time}"
+        f"[{tick.instrument_id}] last={tick.last_price:.1f} "
+        f"bid1={tick.bid_price1:.1f}x{tick.bid_volume1} "
+        f"ask1={tick.ask_price1:.1f}x{tick.ask_volume1} "
+        f"vol={tick.volume} oi={tick.open_interest:.0f} t={tick.update_time}"
     )
 
 
-async def main():
-    # 读取账号配置
-    user_id = os.environ.get('CTP_USER_ID', '')
-    password = os.environ.get('CTP_PASSWORD', '')
-    auth_code = os.environ.get('CTP_AUTH_CODE', '')
+async def _run(args: argparse.Namespace) -> dict:
+    load_api_keys(dry_run=True, hl_exec_mode="remote")
 
-    if not user_id or not password:
-        logger.error("请设置环境变量 CTP_USER_ID, CTP_PASSWORD, CTP_AUTH_CODE")
-        logger.info("  export CTP_USER_ID='55021'")
-        logger.info("  export CTP_PASSWORD='your_password'")
-        logger.info("  export CTP_AUTH_CODE='your_auth_code'")
-        return
+    if not API.ctp_user_id or not API.ctp_password or not API.ctp_auth_code:
+        raise RuntimeError("Missing CTP env: CTP_USER_ID / CTP_PASSWORD / CTP_AUTH_CODE")
 
-    front_candidates = [
-        ("tcp://114.80.225.10:41213", "tcp://114.80.225.10:41205"),
-        ("tcp://140.206.244.75:41213", "tcp://140.206.244.75:41205"),
-        ("tcp://140.206.244.67:41213", "tcp://140.206.244.67:41205"),
-        ("tcp://114.80.225.2:41213", "tcp://114.80.225.2:41205"),
-    ]
-    gateway = None
+    fronts = get_ctp_front_candidates()
+    if args.max_fronts > 0:
+        fronts = fronts[: args.max_fronts]
+    if not fronts:
+        raise RuntimeError("No CTP fronts configured")
 
+    gateway = CTPGateway(
+        broker_id=API.ctp_broker_id,
+        user_id=API.ctp_user_id,
+        password=API.ctp_password,
+        md_front=API.ctp_md_front,
+        td_front=API.ctp_td_front,
+        app_id=API.ctp_app_id,
+        auth_code=API.ctp_auth_code,
+    )
+
+    connected_front = None
+    last_error = None
+    account_obj = None
+    positions = []
     try:
-        # 1. 连接(自动轮询前置)
-        logger.info("=" * 60)
-        logger.info("步骤 1: 连接国贸期货仿真环境...")
-        logger.info("=" * 60)
-        connected = False
-        for idx, (md_front, td_front) in enumerate(front_candidates, start=1):
-            logger.info(f"尝试前置 [{idx}/{len(front_candidates)}] MD={md_front}, TD={td_front}")
-            gateway = CTPGateway(
-                broker_id="0187",
-                user_id=user_id,
-                password=password,
-                md_front=md_front,
-                td_front=td_front,
-                app_id="client_Lavas_1.0.0",
-                auth_code=auth_code,
-            )
+        for idx, (md_front, td_front) in enumerate(fronts, start=1):
+            logger.info(f"Try front [{idx}/{len(fronts)}] md={md_front} td={td_front}")
+            gateway.md_front = md_front
+            gateway.td_front = td_front
             try:
-                await gateway.connect(timeout=30)
-                connected = True
-                logger.info(f"前置连接成功: MD={md_front}, TD={td_front}")
+                await asyncio.wait_for(gateway.connect(timeout=args.connect_timeout), timeout=args.connect_timeout + 5)
+                connected_front = {"md": md_front, "td": td_front}
+                logger.info(f"Connected front md={md_front} td={td_front}, trading_day={gateway.trading_day}")
                 break
             except Exception as e:
-                logger.warning(f"前置连接失败: {e}")
-                await gateway.close()
-                gateway = None
+                last_error = str(e)
+                logger.warning(f"Front failed md={md_front} td={td_front}, err={e}")
+                try:
+                    await gateway.close()
+                except Exception:
+                    pass
 
-        if not connected or gateway is None:
-            raise ConnectionError("所有 CTP 前置均连接失败")
+        if connected_front is None:
+            raise RuntimeError(f"All fronts failed, last_error={last_error}")
 
-        logger.info(f"交易日: {gateway.trading_day}")
+        if args.quote_wait_sec > 0:
+            for inst in args.instruments:
+                gateway.subscribe(inst)
+                gateway.on_tick(inst, _on_tick)
+            logger.info(f"Subscribed {args.instruments}, wait {args.quote_wait_sec}s for ticks")
+            await asyncio.sleep(args.quote_wait_sec)
 
-        # 2. 订阅行情 (白银主力 + 黄金主力)
-        logger.info("=" * 60)
-        logger.info("步骤 2: 订阅行情...")
-        logger.info("=" * 60)
-        instruments = ['ag2506', 'au2506']
-        for inst in instruments:
-            gateway.subscribe(inst)
-            gateway.on_tick(inst, on_tick)
+        logger.info("Query account...")
+        account_obj = await gateway.query_account()
 
-        # 等待接收行情
-        logger.info("等待接收行情数据 (30秒)...")
-        await asyncio.sleep(30)
+        if args.query_positions:
+            logger.info("Query positions...")
+            positions = await gateway.query_positions()
 
-        # 3. 查看最新行情
-        logger.info("=" * 60)
-        logger.info("步骤 3: 查看最新行情...")
-        logger.info("=" * 60)
-        for inst in instruments:
-            tick = gateway.get_tick(inst)
-            if tick:
-                logger.info(f"{inst}: 最新价={tick.last_price}, "
-                          f"买一={tick.bid_price1}, 卖一={tick.ask_price1}")
-            else:
-                logger.warning(f"{inst}: 未收到行情 (可能不在交易时段)")
+        account = None
+        if account_obj:
+            account = {
+                "balance": account_obj.balance,
+                "available": account_obj.available,
+                "frozen": account_obj.frozen,
+                "margin": account_obj.margin,
+                "profit": account_obj.profit,
+                "commission": account_obj.commission,
+            }
 
-        # 4. 查询资金
-        logger.info("=" * 60)
-        logger.info("步骤 4: 查询账户资金...")
-        logger.info("=" * 60)
-        account = await gateway.query_account()
-        if account:
-            logger.info(f"总资金: {account.balance:.2f}")
-            logger.info(f"可用:   {account.available:.2f}")
-            logger.info(f"冻结:   {account.frozen:.2f}")
-            logger.info(f"保证金: {account.margin:.2f}")
-            logger.info(f"盈亏:   {account.profit:.2f}")
+        pos_items = []
+        for p in positions or []:
+            if p.volume <= 0:
+                continue
+            pos_items.append(
+                {
+                    "instrument_id": p.instrument_id,
+                    "direction": p.direction,
+                    "volume": p.volume,
+                    "available": p.available,
+                    "avg_price": p.avg_price,
+                    "profit": p.profit,
+                    "margin": p.margin,
+                }
+            )
 
-        # 5. 查询持仓
-        logger.info("=" * 60)
-        logger.info("步骤 5: 查询持仓...")
-        logger.info("=" * 60)
-        positions = await gateway.query_positions()
-        if positions:
-            for pos in positions:
-                if pos.volume > 0:
-                    logger.info(f"{pos.instrument_id} {pos.direction}: "
-                              f"{pos.volume}手, 均价={pos.avg_price:.2f}, "
-                              f"盈亏={pos.profit:.2f}")
-        else:
-            logger.info("当前无持仓")
-
-        logger.info("=" * 60)
-        logger.info("测试完成!")
-        logger.info("=" * 60)
-
-    except ConnectionError as e:
-        logger.error(f"连接失败: {e}")
-        logger.info("请检查:")
-        logger.info("  1. 网络是否可达 140.206.244.75")
-        logger.info("  2. 账号密码是否正确")
-        logger.info("  3. 是否在交易时段 (仿真可能有时间限制)")
-    except Exception as e:
-        logger.error(f"测试出错: {e}", exc_info=True)
+        return {
+            "ok": True,
+            "front": connected_front,
+            "trading_day": gateway.trading_day,
+            "account": account,
+            "positions": pos_items,
+        }
     finally:
-        if gateway:
-            await gateway.close()
+        # NOTE:
+        # In some environments, CTP native close/join may block for a long time.
+        # For one-shot diagnostic scripts, we skip explicit close here and rely on
+        # process termination to avoid hanging the terminal.
+        pass
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="CTP connection check")
+    parser.add_argument("--env-file", default=".env", help="env file path, e.g. .env1")
+    parser.add_argument("--hard-timeout-sec", type=float, default=60.0, help="total timeout for full script")
+    parser.add_argument("--connect-timeout", type=float, default=20.0, help="connect timeout per front")
+    parser.add_argument("--max-fronts", type=int, default=1, help="front count to try (default primary only)")
+    parser.add_argument("--quote-wait-sec", type=float, default=0.0, help="wait seconds after subscribe")
+    parser.add_argument(
+        "--instruments",
+        nargs="*",
+        default=["ag2506"],
+        help="instruments to subscribe when quote-wait-sec > 0",
+    )
+    parser.add_argument("--query-positions", action="store_true", help="query positions too")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+    try:
+        _load_env_file(args.env_file)
+        result = asyncio.run(asyncio.wait_for(_run(args), timeout=args.hard_timeout_sec))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except asyncio.TimeoutError:
+        print(json.dumps({"ok": False, "error": f"timeout>{args.hard_timeout_sec}s"}, ensure_ascii=False))
+        return 124
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        return 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    code = main()
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        os._exit(code)

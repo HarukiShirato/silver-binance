@@ -18,29 +18,29 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 @dataclass
 class TradingPair:
-    """交易对配置"""
+    """Trading pair config."""
     name: str                        # 名称: SILVER
-    # Hyperliquid 侧
-    hl_symbol: str = ""              # HL 合约代码 (如 SILVER)
+    # Hyperliquid �?
+    hl_symbol: str = ""              # HL 合约代码 (�?SILVER)
     hl_leverage: int = 5             # HL 杠杆倍数
-    # CTP 侧
-    ctp_instrument: str = ""         # CTP 合约代码 (如 ag2506)
+    # CTP �?
+    ctp_instrument: str = ""         # CTP 合约代码 (�?ag2506)
     ctp_exchange: str = "SHFE"       # 交易所代码
-    ctp_multiplier: int = 15         # 合约乘数 (白银 15kg/手)
+    ctp_multiplier: int = 15         # 合约乘数 (白银 15kg/�?
     ctp_margin_rate: float = 0.09    # 保证金率 (~9%)
     # 资金
     capital: float = 50000           # 本金 (RMB)
 
 
-# ==================== 交易对配置 ====================
+# ==================== 交易对配�?====================
 TRADING_PAIRS: Dict[str, TradingPair] = {
     'SILVER': TradingPair(
         name='SILVER',
         hl_symbol='SILVER',
         hl_leverage=5,
-        ctp_instrument='ag2606',      # 白银主力合约 (需要根据实际主力切换)
+        ctp_instrument='ag2606',      # 白银主力合约 (需要根据实际主力切�?
         ctp_exchange='SHFE',
-        ctp_multiplier=15,            # 白银 15kg/手
+        ctp_multiplier=15,            # 白银 15kg/�?
         ctp_margin_rate=0.09,         # ~9% 保证金率
         capital=50000,
     ),
@@ -50,29 +50,29 @@ TRADING_PAIRS: Dict[str, TradingPair] = {
 # ==================== 策略参数 ====================
 @dataclass
 class StrategyConfig:
-    # 入场/出场阈值 (来自 spread_backtest_1m.py 最优参数扫描)
-    entry_zscore: float = 2.3       # Z-score入场阈值 (轻微放宽)
-    exit_zscore: float = 0.8        # Z-score出场阈值
-    stop_loss_zscore: float = 4.0   # 止损阈值
+    # 入场/出场阈�?(来自 spread_backtest_1m.py 最优参数扫�?
+    entry_zscore: float = 2.3       # Z-score入场阈�?(轻微放宽)
+    exit_zscore: float = 0.8        # Z-score出场阈�?
+    stop_loss_zscore: float = 4.0   # 止损阈�?
 
     # 价差计算窗口
-    spread_window: int = 60         # 滚动窗口大小 (分钟, 原240 tick)
-    sample_interval: int = 45       # 采样间隔 (秒)
+    spread_window: int = 60         # 滚动窗口大小 (分钟, �?40 tick)
+    sample_interval: int = 5        # 采样间隔(秒), 60*5s=5分钟收满窗口
 
     # 仓位管理
-    max_position_lots: int = 1      # 最大持仓手数 (最小模式: 仅1手)
+    max_position_lots: int = 1      # 最大持仓手�?(最小模�? �?�?
 
     # 时间控制
-    max_hold_hours: int = 24        # 最大持仓时间
-    cooldown_seconds: int = 120      # 交易后冷却时间
+    max_hold_hours: int = 24        # 最大持仓时�?
+    cooldown_seconds: int = 120      # 交易后冷却时�?
 
     # 滑点保护
-    max_slippage_pct: float = 0.1   # 最大允许滑点 0.1%
+    max_slippage_pct: float = 0.1   # 最大允许滑�?0.1%
     hl_order_slippage_pct: float = 0.003  # HL 下单价格滑点保护 0.3%
-    hl_order_tif: str = "IOC"  # HL 限价单 TIF: IOC | GTC | ALO
-    # 手续费参数（单边）
-    ag_fee_rate: float = 0.00005    # SHFE AG 手续费 万5
-    hl_fee_rate: float = 0.000073   # HL taker 手续费 0.0073%
+    hl_order_tif: str = "IOC"  # HL 限价�?TIF: IOC | GTC | ALO
+    # 手续费参数（单边�?
+    ag_fee_rate: float = 0.00005    # SHFE AG 手续�?�?
+    hl_fee_rate: float = 0.000073   # HL taker 手续�?0.0073%
 
 STRATEGY = StrategyConfig()
 
@@ -94,8 +94,8 @@ class APIConfig:
     ctp_broker_id: str = "0187"
     ctp_user_id: str = ""
     ctp_password: str = ""
-    ctp_md_front: str = "tcp://114.80.225.10:41213"   # 行情前置(主)
-    ctp_td_front: str = "tcp://114.80.225.10:41205"   # 交易前置(主)
+    ctp_md_front: str = "tcp://114.80.225.10:41213"   # 行情前置(�?
+    ctp_td_front: str = "tcp://114.80.225.10:41205"   # 交易前置(�?
     ctp_md_front_backups: List[str] = field(default_factory=lambda: [
         "tcp://140.206.244.75:41213",
         "tcp://140.206.244.67:41213",
@@ -111,7 +111,7 @@ class APIConfig:
 
     # 超时设置
     request_timeout: int = 5000     # 请求超时 (ms)
-    ws_ping_interval: int = 20      # WebSocket心跳间隔 (秒)
+    ws_ping_interval: int = 20      # WebSocket心跳间隔 (�?
 
 API = APIConfig()
 
@@ -217,7 +217,7 @@ def _load_hl_key_from_aws_secret(secret_id: str, region: str) -> str:
 
 
 def load_api_keys(dry_run: bool = False, hl_exec_mode: str = "local"):
-    """从环境变量（或 AWS Secrets Manager）加载敏感信息"""
+    """Load sensitive keys from environment or AWS Secrets Manager."""
     # Hyperliquid
     API.hl_dex = os.environ.get('HL_DEX', API.hl_dex)
     API.hl_api_wallet_private_key = os.environ.get('HL_API_WALLET_PRIVATE_KEY', '').strip()
@@ -234,8 +234,8 @@ def load_api_keys(dry_run: bool = False, hl_exec_mode: str = "local"):
         if not API.hl_api_wallet_private_key:
             if not API.hl_api_wallet_secret_id:
                 raise EnvironmentError(
-                    "缺少必要环境变量: HL_API_WALLET_PRIVATE_KEY 或 HL_API_WALLET_SECRET_ID. "
-                    "LIVE本地HL模式下必须提供其一。"
+                    "Missing required env: HL_API_WALLET_PRIVATE_KEY or "
+                    "HL_API_WALLET_SECRET_ID for local LIVE HL mode."
                 )
             API.hl_api_wallet_private_key = _load_hl_key_from_aws_secret(
                 API.hl_api_wallet_secret_id,
@@ -281,7 +281,7 @@ def get_ctp_front_candidates() -> List[Tuple[str, str]]:
 
 
 def validate_api_keys(dry_run: bool = False, hl_exec_mode: str = "local"):
-    """校验 API 密钥是否已配置, 缺失则抛出异常"""
+    """Validate required API keys and raise when missing."""
     missing = []
     if not API.ctp_user_id:
         missing.append('CTP_USER_ID')
@@ -297,7 +297,7 @@ def validate_api_keys(dry_run: bool = False, hl_exec_mode: str = "local"):
             missing.append('HL_WALLET_ADDRESS')
     if missing:
         raise EnvironmentError(
-            f"缺少必要的 API 密钥环境变量: {', '.join(missing)}. "
+            f"缺少必要�?API 密钥环境变量: {', '.join(missing)}. "
             f"请在 .env 文件或环境变量中配置."
         )
 
@@ -307,7 +307,7 @@ def validate_api_keys(dry_run: bool = False, hl_exec_mode: str = "local"):
 class ForexConfig:
     api_source: str = "exchangerate-api"    # 汇率API来源
     fallback_usdcny: float = 7.25           # 默认汇率
-    update_interval: int = 60               # 更新间隔 (秒)
+    update_interval: int = 60               # 更新间隔 (�?
 
 FOREX = ForexConfig()
 
@@ -315,18 +315,18 @@ FOREX = ForexConfig()
 # ==================== 风控配置 ====================
 @dataclass
 class RiskConfig:
-    max_daily_trades: int = 3      # 每日最大交易次数 (0=不限制)
-    max_daily_loss: float = 5000    # 每日最大亏损 (RMB)
-    leg_timeout_sec: float = 2.0    # 第二腿超时时间 (秒)
-    leg_retry_times: int = 2        # 第二腿重试次数
-    emergency_spread_pct: float = 25.0  # 价差超过25%紧急停止
-    # 保证金预警阈值 (CTP 和 HL 共用)
+    max_daily_trades: int = 3      # 每日最大交易次�?(0=不限�?
+    max_daily_loss: float = 5000    # 每日最大亏�?(RMB)
+    leg_timeout_sec: float = 2.0    # 第二腿超时时�?(�?
+    leg_retry_times: int = 2        # 第二腿重试次�?
+    emergency_spread_pct: float = 25.0  # 价差超过25%紧急停�?
+    # 保证金预警阈�?(CTP �?HL 共用)
     margin_warning_pct: float = 0.70   # 70% 预警
     margin_danger_pct: float = 0.85    # 85% 危险 (禁止加仓)
-    margin_critical_pct: float = 0.90  # 90% 临界 (禁止开仓)
-    margin_check_interval: int = 30    # 保证金检查间隔 (秒)
+    margin_critical_pct: float = 0.90  # 90% 临界 (禁止开�?
+    margin_check_interval: int = 30    # 保证金检查间�?(�?
     disconnect_ctp_when_closed: bool = True  # 非交易时段自动断开 CTP
-
+    ctp_query_timeout_sec: float = 12.0  # CTP query timeout (seconds)
     position_reconcile_interval_sec: int = 60
     position_mismatch_alert_cooldown_sec: int = 60
     hl_quote_ws_down_alert_cooldown_sec: int = 60
@@ -351,7 +351,7 @@ NOTIFY = NotifyConfig()
 
 
 def load_notify_config():
-    # 兼容旧变量 FEISHU_WEBHOOK_URL -> trade webhook
+    # 兼容旧变�?FEISHU_WEBHOOK_URL -> trade webhook
     trade = os.environ.get('FEISHU_TRADE_WEBHOOK_URL', '').strip()
     if not trade:
         trade = os.environ.get('FEISHU_WEBHOOK_URL', '').strip()
@@ -363,3 +363,4 @@ def load_notify_config():
 LOG_LEVEL = "INFO"
 LOG_FILE = "logs/arbitrage.log"
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
